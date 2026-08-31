@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e7343"/>
+      <stop offset="40%" stop-color="#18633c"/>
+      <stop offset="100%" stop-color="#124f2f"/>
+    </linearGradient>
+    <linearGradient id="ribbonTop" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="70%" stop-color="#f1f5f3"/>
+      <stop offset="100%" stop-color="#d4ded8"/>
+    </linearGradient>
+    <linearGradient id="ribbonBottom" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="60%" stop-color="#f3f7f5"/>
+      <stop offset="100%" stop-color="#c9d7d0"/>
+    </linearGradient>
+    <linearGradient id="ribbonShade" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#b4c7be"/>
+      <stop offset="100%" stop-color="#eef3f0"/>
+    </linearGradient>
+    <filter id="softGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="12" flood-color="#072b17" flood-opacity="0.5"/>
+    </filter>
+    <filter id="innerShade" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#09311a" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <!-- Forest Green Background Rounded Square -->
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)"/>
+  <!-- Candlestick Center Bars (Trading Chart Indicator inside S) -->
+  <g filter="url(#innerShade)">
+    <!-- Left Candlestick -->
+    <line x1="228" y1="216" x2="228" y2="300" stroke="#f4f7f5" stroke-width="5" stroke-linecap="round"/>
+    <rect x="220" y="234" width="16" height="46" rx="8" fill="#ffffff"/>
+    <!-- Middle Candlestick (Tallest) -->
+    <line x1="256" y1="194" x2="256" y2="322" stroke="#ffffff" stroke-width="5.5" stroke-linecap="round"/>
+    <rect x="247.5" y="208" width="17" height="96" rx="8.5" fill="#ffffff"/>
+    <!-- Right Candlestick -->
+    <line x1="284" y1="230" x2="284" y2="304" stroke="#f4f7f5" stroke-width="5" stroke-linecap="round"/>
+    <rect x="276" y="242" width="16" height="44" rx="8" fill="#ffffff"/>
+  </g>
+  <!-- 3D Ribbon Letter "S" Structure -->
+  <g filter="url(#softGlow)">
+    <!-- Top Curve of S Ribbon -->
+    <path d="M 368 100
+              C 275 92 145 130 134 235
+              C 128 290 178 305 208 295
+              C 170 280 162 238 184 195
+              C 214 135 305 132 368 100 Z"
+           fill="url(#ribbonTop)"/>
+    <!-- Inner Smooth Fold & Sweep of S -->
+    <path d="M 368 100
+              C 320 120 220 130 180 205
+              C 165 235 175 270 208 295
+              C 185 285 160 255 170 215
+              C 185 155 285 118 368 100 Z"
+           fill="url(#ribbonShade)" opacity="0.85"/>
+    <!-- Bottom Curve of S Ribbon -->
+    <path d="M 144 412
+              C 237 420 367 382 378 277
+              C 384 222 334 207 304 217
+              C 342 232 350 274 328 317
+              C 298 377 207 380 144 412 Z"
+           fill="url(#ribbonBottom)"/>
+    <!-- Bottom Inner Fold & Sweep of S -->
+    <path d="M 144 412
+              C 192 392 292 382 332 307
+              C 347 277 337 242 304 217
+              C 327 227 352 257 342 297
+              C 327 357 227 394 144 412 Z"
+           fill="url(#ribbonShade)" opacity="0.85"/>
+  </g>
+</svg>

@@ -1,0 +1,18 @@
+{
+  "name": "Social Trading Platform",
+  "short_name": "Scrolic",
+  "description": "Social trading platform connected to cTrader.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#040906",
+  "theme_color": "#18633c",
+  "icons": [
+    {
+      "src": "/icon-scrolic.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
