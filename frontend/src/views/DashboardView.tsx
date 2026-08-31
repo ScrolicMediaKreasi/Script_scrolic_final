@@ -146,6 +146,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [isSwitching, setIsSwitching] = useState(false);
   const [accountMetrics, setAccountMetrics] = useState<AccountMetricsPayload | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload | null>(null);
+  const [portfolioPage, setPortfolioPage] = useState(1);
+  const PORTFOLIO_PAGE_SIZE = 20;
+
+  // Reset portfolio pagination when active account changes
+  React.useEffect(() => {
+    setPortfolioPage(1);
+  }, [currentUser?.cTraderAccountId, currentUser?.id]);
 
   // Live account metrics and connection state
   React.useEffect(() => {
@@ -781,24 +788,36 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       )}
 
       {/* Tab 3: Portofolio (Closed Trades) */}
-      {activeTab === 'portfolio' && (
+      {activeTab === 'portfolio' && (() => {
+        const sortedClosed = [...accountClosedTrades].sort((a, b) => {
+          const at = new Date(a.closeTime || a.openTime || 0).getTime();
+          const bt = new Date(b.closeTime || b.openTime || 0).getTime();
+          return bt - at;
+        });
+        const totalPages = Math.max(1, Math.ceil(sortedClosed.length / PORTFOLIO_PAGE_SIZE));
+        const currentPage = Math.min(portfolioPage, totalPages);
+        const startIdx = (currentPage - 1) * PORTFOLIO_PAGE_SIZE;
+        const pageItems = sortedClosed.slice(startIdx, startIdx + PORTFOLIO_PAGE_SIZE);
+        return (
         <div className="space-y-2.5">
           <div className="flex justify-between items-center px-1 mb-1 text-xs text-neutral-400">
-            <span>Riwayat ({accountClosedTrades.length}) Trade Terakhir</span>
+            <span data-testid="portfolio-summary">Riwayat ({accountClosedTrades.length}) Trade Terakhir</span>
             <span>Realized P/L</span>
           </div>
-          {accountClosedTrades.length === 0 ? (
+          {sortedClosed.length === 0 ? (
             <div className="text-center py-10 bg-[#111111] rounded-2xl border border-[#1f1f1f] p-4 text-xs text-neutral-400">
               Belum ada riwayat transaksi selesai untuk akun cTrader ini.
             </div>
           ) : (
-            accountClosedTrades.map((t) => {
+            <>
+              {pageItems.map((t) => {
               const isBuy = t.direction === 'BUY';
               const isProfit = (t.profitUSD ?? 0) >= 0;
 
               return (
                 <div 
                   key={t.id}
+                  data-testid={`portfolio-trade-${t.id}`}
                   className="bg-[#111111] border border-[#1f1f1f] rounded-xl p-3 flex items-center justify-between text-xs"
                 >
                   <div className="flex items-center gap-2.5">
@@ -828,10 +847,37 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </div>
                 </div>
               );
-            })
+              })}
+
+              {/* Pagination Controls */}
+              {totalPages > 1 && (
+                <div className="flex items-center justify-between pt-3 pb-1">
+                  <button
+                    data-testid="portfolio-prev-page"
+                    onClick={() => { triggerHaptic('light'); setPortfolioPage((p) => Math.max(1, p - 1)); }}
+                    disabled={currentPage === 1}
+                    className="px-3 py-1.5 rounded-lg bg-[#141414] hover:bg-[#1f1f1f] disabled:opacity-40 disabled:cursor-not-allowed text-neutral-300 border border-[#222222] text-[11px] font-bold cursor-pointer"
+                  >
+                    ← Prev
+                  </button>
+                  <span data-testid="portfolio-page-indicator" className="text-[11px] text-neutral-400 font-mono">
+                    Halaman {currentPage} / {totalPages} • {startIdx + 1}–{Math.min(startIdx + PORTFOLIO_PAGE_SIZE, sortedClosed.length)} dari {sortedClosed.length}
+                  </span>
+                  <button
+                    data-testid="portfolio-next-page"
+                    onClick={() => { triggerHaptic('light'); setPortfolioPage((p) => Math.min(totalPages, p + 1)); }}
+                    disabled={currentPage === totalPages}
+                    className="px-3 py-1.5 rounded-lg bg-[#141414] hover:bg-[#1f1f1f] disabled:opacity-40 disabled:cursor-not-allowed text-neutral-300 border border-[#222222] text-[11px] font-bold cursor-pointer"
+                  >
+                    Next →
+                  </button>
+                </div>
+              )}
+            </>
           )}
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 };

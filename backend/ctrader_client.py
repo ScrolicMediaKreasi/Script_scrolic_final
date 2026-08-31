@@ -753,7 +753,7 @@ class CTraderClient:
             "ctidTraderAccountId": acct_num,
             "fromTimestamp": from_timestamp_ms,
             "toTimestamp": to_timestamp_ms,
-            "maxRows": 100
+            "maxRows": 1000
         })
 
     async def request_position_unrealized_pnl(self, account_id: Any):
