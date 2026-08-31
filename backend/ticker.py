@@ -270,7 +270,15 @@ class CTraderPositionService:
         loop.create_task(ctrader_client.send_message(PROTO_OA_SUBSCRIBE_SPOTS_REQ, message))
 
     def handle_symbols_list_event(self, event_data: Dict[str, Any]):
-        """Registers the broker's account-specific symbol metadata catalog."""
+        """Registers the broker's account-specific symbol metadata catalog.
+
+        ProtoOASymbolsListRes (2115) returns a LIGHTWEIGHT symbol list which
+        does NOT include pipPosition/digits/lotUnits (those live on the full
+        ProtoOASymbol via ProtoOASymbolByIdReq 2116). To avoid clobbering the
+        correct registry defaults (e.g. XAUUSD pipPosition=1), we only
+        overwrite fields that the broker actually sent; missing fields fall
+        back to the existing registry entry when present.
+        """
         symbols = event_data.get("symbol", []) or event_data.get("symbols", []) or []
         for symbol in symbols:
             try:
@@ -278,18 +286,37 @@ class CTraderPositionService:
                 name = str(symbol.get("symbolName") or symbol.get("name") or "").strip()
                 if not name:
                     continue
+                # Look up existing registry entry (either by ID or by name) to preserve pipPosition/digits/lotUnits
+                existing = symbol_registry._symbols_by_id.get(symbol_id) or symbol_registry._symbols_by_name.get(name.upper()) or {}
+
+                def pick(field_key: str, default_value):
+                    raw = symbol.get(field_key)
+                    if raw is None or raw == "":
+                        return existing.get(field_key, default_value)
+                    return raw
+
+                digits_val = int(pick("digits", 5))
+                pip_pos_val = int(pick("pipPosition", 4))
+                lot_units_val = float(symbol.get("lotSize") if symbol.get("lotSize") is not None else (symbol.get("lotUnits") if symbol.get("lotUnits") is not None else existing.get("lotUnits", 100000.0)))
+                lot_size_val = float(symbol["lotSize"]) if symbol.get("lotSize") is not None else (existing.get("lotSize") if existing.get("lotSize") is not None else None)
+                measurement_units_val = float(symbol["measurementUnits"]) if symbol.get("measurementUnits") is not None else (existing.get("measurementUnits") if existing.get("measurementUnits") is not None else None)
+                volume_scale_val = float(symbol["volumeScale"]) if symbol.get("volumeScale") is not None else (existing.get("volumeScale") if existing.get("volumeScale") is not None else None)
+                market_val = str(symbol.get("market") or existing.get("market") or "Forex")
+                base_val = str(symbol.get("baseAssetName") or symbol.get("base") or existing.get("base") or "")
+                quote_val = str(symbol.get("quoteAssetName") or symbol.get("quote") or existing.get("quote") or "")
+
                 symbol_registry.register_symbol_metadata(
                     symbol_id=symbol_id,
                     name=name,
-                    digits=int(symbol.get("digits", 5)),
-                    pip_position=int(symbol.get("pipPosition", 4)),
-                    lot_units=float(symbol.get("lotSize", symbol.get("lotUnits", 100000.0))),
-                    lot_size=float(symbol["lotSize"]) if symbol.get("lotSize") is not None else None,
-                    measurement_units=float(symbol["measurementUnits"]) if symbol.get("measurementUnits") is not None else None,
-                    volume_scale=float(symbol["volumeScale"]) if symbol.get("volumeScale") is not None else None,
-                    market=str(symbol.get("market") or "Forex"),
-                    base=str(symbol.get("baseAssetName") or symbol.get("base") or ""),
-                    quote=str(symbol.get("quoteAssetName") or symbol.get("quote") or "")
+                    digits=digits_val,
+                    pip_position=pip_pos_val,
+                    lot_units=lot_units_val,
+                    lot_size=lot_size_val,
+                    measurement_units=measurement_units_val,
+                    volume_scale=volume_scale_val,
+                    market=market_val,
+                    base=base_val,
+                    quote=quote_val
                 )
             except (TypeError, ValueError):
                 logger.warning("[cTrader.Symbols] Ignoring malformed symbol metadata: %s", symbol)
@@ -556,11 +583,30 @@ class CTraderPositionService:
                         meta = symbol_registry.resolve(symbol_id=symbol_id)
                         symbol = meta["name"]
                         side = normalize_trade_side(deal.get("tradeSide")) or "BUY"
+                        # CLOSING deal side is inverse of position side: BUY deal closes SELL position, SELL deal closes BUY position
+                        position_side = "SELL" if side == "BUY" else "BUY"
                         money_digits = int(detail.get("moneyDigits") or deal.get("moneyDigits") or 2)
                         profit = normalize_money_value(detail.get("grossProfit"), money_digits)
                         swap = normalize_money_value(detail.get("swap"), money_digits)
                         commission = normalize_money_value(detail.get("commission"), money_digits)
+                        # entryPrice inside closePositionDetail may itself be raw-scaled by symbol digits on some brokers.
+                        # If the value looks impossibly large (raw int), scale it down; else keep as float.
+                        raw_entry = detail.get("entryPrice")
+                        entry_price = float(raw_entry or 0.0)
+                        if entry_price > 0 and abs(entry_price) >= 10 ** (int(meta.get("digits", 5)) + 4):
+                            entry_price = entry_price / (10 ** int(meta.get("digits", 5)))
                         close_price = float(deal.get("executionPrice") or 0.0)
+                        pip_size = 10 ** (-int(meta.get("pipPosition", 4)))
+                        # Real pips from price diff, using POSITION side (not deal side)
+                        if position_side == "BUY":
+                            pips_val = round((close_price - entry_price) / pip_size, 1) if entry_price > 0 else 0.0
+                        else:
+                            pips_val = round((entry_price - close_price) / pip_size, 1) if entry_price > 0 else 0.0
+                        lot_val = normalize_volume_lots(deal.get("volume"), meta) or 0.01
+                        # Profit percent: net profit vs notional entry value (approx of margin-normalized return)
+                        notional = entry_price * lot_val * float(meta.get("lotUnits", 100000.0))
+                        net_profit = round(profit + swap + commission, 2)
+                        profit_percent = round((net_profit / notional) * 100.0, 2) if notional > 0 else 0.0
                         closed_at = datetime.fromtimestamp(
                             int(deal.get("executionTimestamp") or time.time() * 1000) / 1000,
                             tz=timezone.utc
@@ -575,13 +621,14 @@ class CTraderPositionService:
                             "symbol": symbol,
                             "market": meta["market"],
                             "strategy_id": user.get("strategy_dna", "breakout"),
-                            "position_type": side,
+                            "position_type": position_side,
                             "status": "CLOSED",
-                            "entry_price": float(detail.get("entryPrice") or 0.0),
+                            "entry_price": entry_price,
                             "current_price": close_price,
-                            "profit": round(profit + swap + commission, 2),
-                            "lot": normalize_volume_lots(deal.get("volume"), meta) or 0.01,
-                            "pips": 0.0,
+                            "profit": net_profit,
+                            "profit_percent": profit_percent,
+                            "lot": lot_val,
+                            "pips": pips_val,
                             "duration": "Closed Deal",
                             "opened_at": closed_at,
                             "closed_at": closed_at,
@@ -595,6 +642,19 @@ class CTraderPositionService:
                         swap = normalize_money_value(detail.get("swap"), money_digits)
                         commission = normalize_money_value(detail.get("commission"), money_digits)
                         close_price = float(deal.get("executionPrice") or post.get("current_price") or 0.0)
+                        entry_price = float(post.get("entry_price") or 0.0)
+                        symbol_name = post.get("symbol") or ""
+                        meta = symbol_registry.resolve(symbol_name=symbol_name)
+                        pip_size = 10 ** (-int(meta.get("pipPosition", 4)))
+                        position_side = str(post.get("position_type") or "BUY").upper()
+                        if position_side == "BUY":
+                            pips_val = round((close_price - entry_price) / pip_size, 1) if entry_price > 0 else float(post.get("pips") or 0.0)
+                        else:
+                            pips_val = round((entry_price - close_price) / pip_size, 1) if entry_price > 0 else float(post.get("pips") or 0.0)
+                        lot_val = float(post.get("lot") or 0.01)
+                        notional = entry_price * lot_val * float(meta.get("lotUnits", 100000.0))
+                        net_profit = round(profit + swap + commission, 2)
+                        profit_percent = round((net_profit / notional) * 100.0, 2) if notional > 0 else 0.0
                         closed_at = datetime.fromtimestamp(
                             int(deal.get("executionTimestamp") or time.time() * 1000) / 1000,
                             tz=timezone.utc
@@ -602,7 +662,9 @@ class CTraderPositionService:
                         db_store.update_post(post_id, {
                             "status": "CLOSED",
                             "current_price": close_price,
-                            "profit": round(profit + swap + commission, 2),
+                            "profit": net_profit,
+                            "profit_percent": profit_percent,
+                            "pips": pips_val,
                             "closed_at": closed_at,
                             "updated_at": datetime.now(timezone.utc)
                         })
@@ -613,7 +675,7 @@ class CTraderPositionService:
                                     "postId": post_id,
                                     "tradeId": position_id,
                                     "closePrice": close_price,
-                                    "profit": round(profit + swap + commission, 2),
+                                    "profit": net_profit,
                                     "closedAt": closed_at
                                 })))
 

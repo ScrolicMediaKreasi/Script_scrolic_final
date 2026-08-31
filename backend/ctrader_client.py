@@ -114,6 +114,7 @@ class CTraderClient:
         self._account_list_future: Optional[asyncio.Future] = None
         self._reconcile_futures: Dict[int, asyncio.Future] = {}
         self._deal_list_futures: Dict[int, asyncio.Future] = {}
+        self._symbols_list_futures: Dict[int, asyncio.Future] = {}
         
         # Per-Account Status Tracking
         # Structure: { ctidTraderAccountId: { accountNo, userId, authStatus, authenticatedAt, lastReconciledAt, lastError } }
@@ -771,9 +772,18 @@ class CTraderClient:
         loop = asyncio.get_event_loop()
         reconcile_future = loop.create_future()
         deal_future = loop.create_future()
+        symbols_future = loop.create_future()
         self._reconcile_futures[acct_num] = reconcile_future
         self._deal_list_futures[acct_num] = deal_future
+        self._symbols_list_futures[acct_num] = symbols_future
+        # Request symbols catalog first so pipPosition/digits/lotUnits are populated before deal processing
+        await self.send_message(PROTO_OA_SYMBOLS_LIST_REQ, {"ctidTraderAccountId": acct_num})
         await self.send_message(PROTO_OA_RECONCILE_REQ, {"ctidTraderAccountId": acct_num})
+        # Wait briefly for symbols before requesting deals so downstream handlers can resolve symbols correctly
+        try:
+            await asyncio.wait_for(symbols_future, timeout=6.0)
+        except Exception:
+            pass
         await self.request_deal_history(acct_num, from_timestamp_ms, to_timestamp_ms)
         errors = []
         try:
@@ -791,6 +801,7 @@ class CTraderClient:
         finally:
             self._reconcile_futures.pop(acct_num, None)
             self._deal_list_futures.pop(acct_num, None)
+            self._symbols_list_futures.pop(acct_num, None)
         return {
             "reconciled": reconcile_future.done() and not reconcile_future.cancelled(),
             "deals": deal_future.done() and not deal_future.cancelled(),
@@ -812,24 +823,35 @@ class CTraderClient:
             self.account_states[acct_num]["authStatus"] = AccountAuthStatus.AUTHENTICATED.value
             self.account_states[acct_num]["authenticatedAt"] = now_iso
             self.account_states[acct_num]["lastError"] = None
-        
-        # Trigger Official Trader Profile / Balance (2121)
-        asyncio.create_task(self.send_message(PROTO_OA_TRADER_REQ, {
-            "ctidTraderAccountId": acct_num
-        }))
-        # Load the account's symbol catalog before resolving broker positions/deals.
-        asyncio.create_task(self.send_message(PROTO_OA_SYMBOLS_LIST_REQ, {
-            "ctidTraderAccountId": acct_num
-        }))
-        # Trigger Official Position Reconciliation (2124)
-        asyncio.create_task(self.send_message(PROTO_OA_RECONCILE_REQ, {
-            "ctidTraderAccountId": acct_num
-        }))
-        # Trigger Official Deal List History Request (2133) for last 30 days
-        now_ms = int(time.time() * 1000)
-        from_ms = now_ms - (30 * 24 * 3600 * 1000)
-        asyncio.create_task(self.request_deal_history(acct_num, from_ms, now_ms))
+
+        # Kick off ordered post-auth requests: Trader + SymbolsList first, then Reconcile + DealList.
+        # Waiting for symbols list ensures pipPosition/digits/lotUnits are populated before deals arrive
+        # so pips and lot calculations use broker-specific metadata (not fallback defaults).
+        asyncio.create_task(self._post_auth_bootstrap(acct_num))
         logger.info(f"[cTrader.Auth] Account {acct_num} AUTHENTICATED. Triggered Symbols (2114), Trader (2121), Reconcile (2124), & DealList (2133).")
+
+    async def _post_auth_bootstrap(self, acct_num: int):
+        try:
+            # Trader profile (2121) - can go in parallel with symbols
+            asyncio.create_task(self.send_message(PROTO_OA_TRADER_REQ, {"ctidTraderAccountId": acct_num}))
+            # Symbols catalog (2114) FIRST — wait for response before firing deal list
+            loop = asyncio.get_event_loop()
+            symbols_future = loop.create_future()
+            self._symbols_list_futures[acct_num] = symbols_future
+            await self.send_message(PROTO_OA_SYMBOLS_LIST_REQ, {"ctidTraderAccountId": acct_num})
+            try:
+                await asyncio.wait_for(symbols_future, timeout=8.0)
+            except Exception as exc:
+                logger.warning(f"[cTrader.Auth] SymbolsList wait timeout/err for {acct_num}: {exc}")
+            finally:
+                self._symbols_list_futures.pop(acct_num, None)
+            # Now safe to fire reconcile + deal history (handlers can resolve symbols)
+            asyncio.create_task(self.send_message(PROTO_OA_RECONCILE_REQ, {"ctidTraderAccountId": acct_num}))
+            now_ms = int(time.time() * 1000)
+            from_ms = now_ms - (365 * 24 * 3600 * 1000)
+            asyncio.create_task(self.request_deal_history(acct_num, from_ms, now_ms))
+        except Exception as exc:
+            logger.error(f"[cTrader.Auth] _post_auth_bootstrap error for {acct_num}: {exc}")
 
     async def send_message(self, payload_type: int, payload_data: Dict[str, Any]):
         """Sends a binary ProtoMessage over the active cTrader transport."""
@@ -1011,7 +1033,7 @@ class CTraderClient:
                 fut = self._account_auth_futures[acct_num]
                 if not fut.done():
                     fut.set_exception(ValueError(f"[{error_code}] {desc}"))
-            for future_map in (self._reconcile_futures, self._deal_list_futures):
+            for future_map in (self._reconcile_futures, self._deal_list_futures, self._symbols_list_futures):
                 future = future_map.get(acct_num)
                 if future and not future.done():
                     future.set_exception(ValueError(f"[{error_code}] {desc}"))
@@ -1023,6 +1045,13 @@ class CTraderClient:
                 h(payload_data)
             except Exception as handler_err:
                 logger.error(f"[cTrader.Handler] Handler error for payload {payload_type}: {handler_err}")
+
+        # Resolve symbols list future so request_snapshot can proceed with populated registry
+        if payload_type == PROTO_OA_SYMBOLS_LIST_RES:
+            acct_num = self._as_int(payload_data.get("ctidTraderAccountId"))
+            future = self._symbols_list_futures.get(acct_num)
+            if future and not future.done():
+                future.set_result(payload_data)
 
         if payload_type == PROTO_OA_DEAL_LIST_RES and payload_data.get("hasMore"):
             acct_num = self._as_int(payload_data.get("ctidTraderAccountId"))

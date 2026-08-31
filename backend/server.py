@@ -1261,65 +1261,106 @@ async def sync_ctrader_account_trades(user_id: str) -> dict:
     # Process closed deals into portfolio history feed posts
     if closed_deals:
         for deal in closed_deals:
+            # Only process actual CLOSING deals (with closePositionDetail); opening deals will be handled via position/reconcile
+            detail = deal.get("closePositionDetail") if isinstance(deal.get("closePositionDetail"), dict) else None
+            if not detail:
+                continue
             deal_id = str(deal.get("dealId") or deal.get("id") or f"deal-{int(datetime.now().timestamp())}")
-            t_data = deal.get("tradeData", {}) if isinstance(deal.get("tradeData"), dict) else deal
+            position_id = str(deal.get("positionId") or "")
+            if not position_id:
+                continue
+            # Consistent post_id with ticker.handle_deal_list_event to avoid duplicates
+            acct_num_int = ctrader_client._clean_numeric_account_id(account_id)
+            post_id = f"post-ctrader-{acct_num_int}-{position_id}"
+
             from backend.ticker import normalize_money_value, symbol_registry
-            raw_symbol_id = t_data.get("symbolId") or deal.get("symbolId")
+            raw_symbol_id = deal.get("symbolId")
             symbol_meta = symbol_registry.resolve(
                 symbol_id=int(raw_symbol_id) if raw_symbol_id is not None else None,
-                symbol_name=t_data.get("symbolName") or t_data.get("symbol") or deal.get("symbolName")
+                symbol_name=deal.get("symbolName")
             )
             symbol = symbol_meta["name"]
-            raw_side = t_data.get("tradeSide") if (isinstance(t_data, dict) and t_data.get("tradeSide") is not None) else deal.get("tradeSide")
-            trade_side = "BUY" if str(raw_side or "").upper() in ["BUY", "1"] else "SELL"
-            vol = calculate_ctrader_lots(deal.get("volume", 100000), symbol)
-            entry = float(deal.get("executionPrice") or deal.get("price") or 2914.50)
-            raw_gross = float(deal.get("grossProfit") or deal.get("profit") or 0.0)
-            raw_swap = float(deal.get("swap") or 0.0)
-            raw_comm = float(deal.get("commission") or 0.0)
-            raw_total = raw_gross + raw_swap + raw_comm
-            money_digits = int(account_state.get("moneyDigits", 2))
-            pnl = normalize_money_value(raw_total, money_digits)
-            meta = symbol_registry.resolve(symbol_name=symbol)
-            pip_size = 10 ** (-meta["pipPosition"])
-            pips = round((pnl / (vol * meta.get("lotUnits", 1.0) * pip_size)), 1) if vol > 0 else 0.0
+            # Deal side = order side that closed the position; position side is inverse
+            raw_side = deal.get("tradeSide")
+            deal_side = "BUY" if str(raw_side or "").upper() in ["BUY", "1"] else "SELL"
+            position_side = "SELL" if deal_side == "BUY" else "BUY"
 
-            matched_deal = next((p for p in existing_user_posts if p.get("trade_id") == deal_id or p.get("id") == f"post-ctrader-{deal_id}"), None)
-            if matched_deal:
-                matched_deal["profit"] = pnl
-                matched_deal["pips"] = pips
-                matched_deal["account_id"] = account_id
-                matched_deal["status"] = "CLOSED"
+            vol = calculate_ctrader_lots(deal.get("volume", 100000), symbol)
+
+            # Read profit fields from closePositionDetail (correct location per cTrader Open API spec)
+            money_digits = int(detail.get("moneyDigits") or deal.get("moneyDigits") or account_state.get("moneyDigits", 2))
+            gross = normalize_money_value(detail.get("grossProfit"), money_digits)
+            swap = normalize_money_value(detail.get("swap"), money_digits)
+            commission = normalize_money_value(detail.get("commission"), money_digits)
+            net_profit = round(gross + swap + commission, 2)
+
+            # entryPrice from closePositionDetail; some brokers scale it by symbol digits
+            raw_entry = detail.get("entryPrice")
+            entry_price = float(raw_entry or 0.0)
+            digits = int(symbol_meta.get("digits", 5))
+            if entry_price > 0 and abs(entry_price) >= 10 ** (digits + 4):
+                entry_price = entry_price / (10 ** digits)
+            close_price = float(deal.get("executionPrice") or 0.0)
+
+            pip_size = 10 ** (-int(symbol_meta.get("pipPosition", 4)))
+            if position_side == "BUY":
+                pips = round((close_price - entry_price) / pip_size, 1) if entry_price > 0 else 0.0
+            else:
+                pips = round((entry_price - close_price) / pip_size, 1) if entry_price > 0 else 0.0
+
+            notional = entry_price * vol * float(symbol_meta.get("lotUnits", 100000.0))
+            profit_percent = round((net_profit / notional) * 100.0, 2) if notional > 0 else 0.0
+
+            closed_at_dt = datetime.fromtimestamp(
+                int(deal.get("executionTimestamp") or time.time() * 1000) / 1000,
+                tz=timezone.utc
+            )
+
+            existing_post = db_store.find_post_by_id(post_id) if hasattr(db_store, "find_post_by_id") else next((p for p in db_store.posts if p.get("id") == post_id), None)
+            if existing_post:
+                existing_post["entry_price"] = entry_price
+                existing_post["current_price"] = close_price
+                existing_post["profit"] = net_profit
+                existing_post["profit_percent"] = profit_percent
+                existing_post["pips"] = pips
+                existing_post["lot"] = round(vol, 2)
+                existing_post["position_type"] = position_side
+                existing_post["symbol"] = symbol
+                existing_post["account_id"] = account_id
+                existing_post["status"] = "CLOSED"
+                existing_post["closed_at"] = closed_at_dt
+                existing_post["source"] = "broker_ctrader"
+                existing_post["is_simulation"] = False
             else:
                 db_store.create_post({
-                    "id": f"post-ctrader-{deal_id}",
+                    "id": post_id,
                     "account_id": account_id,
                     "user_id": user_uid,
                     "username": user.get("username"),
                     "avatar": user.get("avatar"),
-                    "trade_id": deal_id,
+                    "trade_id": position_id,
                     "symbol": symbol,
-                    "market": "Crypto" if "BTC" in symbol else "Commodity" if "XAU" in symbol else "Forex",
+                    "market": symbol_meta.get("market", "Forex"),
                     "strategy_id": user.get("strategy_dna", "breakout"),
-                    "position_type": trade_side,
+                    "position_type": position_side,
                     "status": "CLOSED",
-                    "entry_price": entry,
-                    "current_price": entry,
-                    "progress": 100 if pnl >= 0 else 0,
-                    "profit": pnl,
-                    "profit_percent": round((pnl / max(1.0, entry * symbol_registry.resolve(symbol_name=symbol).get("lotUnits", 1.0) * vol)) * 100, 2) if entry > 0 else 0.0,
+                    "entry_price": entry_price,
+                    "current_price": close_price,
+                    "progress": 100 if net_profit >= 0 else 0,
+                    "profit": net_profit,
+                    "profit_percent": profit_percent,
                     "lot": round(vol, 2),
                     "pips": pips,
                     "duration": "Closed Deal",
-                    "opened_at": datetime.now(timezone.utc),
-                    "closed_at": datetime.now(timezone.utc),
+                    "opened_at": closed_at_dt,
+                    "closed_at": closed_at_dt,
                     "visibility": "LOCKED",
                     "unlock_price": 1,
                     "follow_price": 1,
                     "source": "broker_ctrader",
                     "is_simulation": False,
                     "account_type": "LIVE" if bool((user.get("ctrader_accounts") or [{}])[0].get("isLive")) else "DEMO",
-                    "auto_description": f"Closed Deal via cTrader ({account_id}): {trade_side} {round(vol, 2)} Lot {symbol} ({'Profit' if pnl >= 0 else 'Loss'} ${pnl})",
+                    "auto_description": f"Closed Deal via cTrader ({account_id}): {position_side} {round(vol, 2)} Lot {symbol} ({'Profit' if net_profit >= 0 else 'Loss'} ${abs(net_profit):.2f})",
                     "custom_description": f"Transaksi cTrader {account_id} Selesai"
                 })
 
