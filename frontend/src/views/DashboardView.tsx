@@ -56,8 +56,13 @@ const DashboardLiveTradeItem: React.FC<DashboardLiveTradeItemProps> = ({ trade, 
   const [isClosing, setIsClosing] = React.useState(false);
 
   React.useEffect(() => {
-    setLocalTrade(trade);
-  }, [trade]);
+    setLocalTrade((prev) => {
+      if (prev.id === trade.id) {
+        return { ...prev, ...trade };
+      }
+      return trade;
+    });
+  }, [trade.id]);
 
   React.useEffect(() => {
     const unsub = livePositionStore.subscribe(trade.id, (update) => {
@@ -92,10 +97,10 @@ const DashboardLiveTradeItem: React.FC<DashboardLiveTradeItemProps> = ({ trade, 
         </div>
         <div className="text-right">
           <span className={`text-sm font-bold font-mono ${isProfit ? 'text-emerald-400' : 'text-rose-400'}`}>
-            {isProfit ? '+' : ''}{(localTrade.pips ?? 0).toFixed(1)} Pips
+            {isProfit ? '+$' : '-$'}{Math.abs(localTrade.profitUSD ?? 0).toFixed(2)}
           </span>
           <span className="text-[11px] text-neutral-400 block font-mono">
-            {isProfit ? '+$' : '-$'}{Math.abs(localTrade.profitUSD ?? 0).toFixed(2)}
+            ({isProfit ? '+' : ''}{(localTrade.profitPercent ?? 0).toFixed(2)}%)
           </span>
         </div>
       </div>
@@ -148,11 +153,48 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload | null>(null);
   const [portfolioPage, setPortfolioPage] = useState(1);
   const PORTFOLIO_PAGE_SIZE = 20;
+  const [portfolioData, setPortfolioData] = useState<{
+    trades: Trade[];
+    total: number;
+    totalPages: number;
+    aggregate: { totalTrades: number; winningTrades: number; losingTrades: number; winRate: number; totalProfitUSD: number; totalPips: number };
+  } | null>(null);
+  const [portfolioLoading, setPortfolioLoading] = useState(false);
 
   // Reset portfolio pagination when active account changes
   React.useEffect(() => {
     setPortfolioPage(1);
   }, [currentUser?.cTraderAccountId, currentUser?.id]);
+
+  // Fetch full closed trades (paginated) for portfolio + aggregate stats
+  React.useEffect(() => {
+    if (!currentUser?.username && !currentUser?.id) return;
+    const key = currentUser.username || currentUser.id;
+    let cancelled = false;
+    setPortfolioLoading(true);
+    (async () => {
+      try {
+        const savedUserId = localStorage.getItem('scrolic_user_id') || currentUser.id;
+        const res = await fetch(`/api/users/${encodeURIComponent(key)}/closed-trades?page=${portfolioPage}&size=${PORTFOLIO_PAGE_SIZE}`, {
+          headers: { 'x-session-user-id': savedUserId }
+        });
+        const data = await res.json();
+        if (!cancelled && data?.success) {
+          setPortfolioData({
+            trades: data.trades || [],
+            total: data.pagination?.total || 0,
+            totalPages: data.pagination?.totalPages || 1,
+            aggregate: data.aggregate || { totalTrades: 0, winningTrades: 0, losingTrades: 0, winRate: 0, totalProfitUSD: 0, totalPips: 0 }
+          });
+        }
+      } catch (err) {
+        console.warn('[Dashboard] closed-trades fetch error:', err);
+      } finally {
+        if (!cancelled) setPortfolioLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [currentUser?.username, currentUser?.id, portfolioPage, syncSuccessMsg]);
 
   // Live account metrics and connection state
   React.useEffect(() => {
@@ -218,9 +260,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     );
   }
 
-  const currentAccounts = (currentUser.cTraderAccounts && currentUser.cTraderAccounts.length > 0)
-    ? currentUser.cTraderAccounts
-    : (currentUser.cTraderAccountId ? [{ accountId: currentUser.cTraderAccountId, brokerName: currentUser.cTraderBroker || 'cTrader', accountType: 'LIVE', currency: 'USD', balance: currentUser.totalProfitUSD || 10000, isLive: true }] : []);
+  const currentAccounts: Array<{
+    accountId: string;
+    brokerName?: string;
+    accountType?: 'LIVE' | 'DEMO' | string;
+    currency?: string;
+    balance?: number;
+    leverage?: number;
+    isLive?: boolean;
+  }> = (currentUser.cTraderAccounts && currentUser.cTraderAccounts.length > 0)
+    ? currentUser.cTraderAccounts.map((account) => ({
+        ...account,
+        accountType: account.accountType || 'LIVE',
+        leverage: account.leverage ?? 500,
+      }))
+    : (currentUser.cTraderAccountId ? [{ accountId: currentUser.cTraderAccountId, brokerName: currentUser.cTraderBroker || 'cTrader', accountType: 'LIVE', currency: 'USD', balance: currentUser.totalProfitUSD || 10000, leverage: 500, isLive: true }] : []);
 
   const activeAccount = currentAccounts.find((a) => a.accountId === currentUser.cTraderAccountId) || currentAccounts[0];
 
@@ -391,16 +445,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     }
   };
 
-  // Compute live performance metrics
-  const totalTradesCount = Math.max(accountLiveTrades.length + accountClosedTrades.length, currentUser.totalTrades || 0, (currentUser as any).totalTradesCount || 0);
-  const winningTrades = accountClosedTrades.filter((t) => (t.profitUSD ?? 0) > 0);
-  const calculatedWinRate = accountClosedTrades.length > 0 ? (winningTrades.length / accountClosedTrades.length) * 100 : 0;
-  const winRate = (currentUser.winRate && currentUser.winRate > 0)
-    ? currentUser.winRate.toFixed(1)
-    : accountClosedTrades.length > 0
-    ? calculatedWinRate.toFixed(1)
-    : '0.0';
-  const closedProfitUSD = accountClosedTrades.reduce((acc, t) => acc + (t.profitUSD ?? 0), 0);
+  // Compute live performance metrics — prefer server-side aggregate over local props (which may be limited to 8 posts)
+  const agg = portfolioData?.aggregate;
+  const closedFromServer = agg?.totalTrades ?? accountClosedTrades.length;
+  const winsFromServer = agg?.winningTrades ?? accountClosedTrades.filter((t) => (t.profitUSD ?? 0) > 0).length;
+  const lossesFromServer = agg?.losingTrades ?? accountClosedTrades.filter((t) => (t.profitUSD ?? 0) < 0).length;
+  const totalTradesCount = Math.max(accountLiveTrades.length + closedFromServer, currentUser.totalTrades || 0, (currentUser as any).totalTradesCount || 0);
+  const winRate = agg
+    ? agg.winRate.toFixed(1)
+    : (currentUser.winRate && currentUser.winRate > 0)
+      ? currentUser.winRate.toFixed(1)
+      : accountClosedTrades.length > 0
+        ? ((winsFromServer / Math.max(1, accountClosedTrades.length)) * 100).toFixed(1)
+        : '0.0';
+  const closedProfitUSD = agg?.totalProfitUSD ?? accountClosedTrades.reduce((acc, t) => acc + (t.profitUSD ?? 0), 0);
   const liveProfitUSD = accountLiveTrades.reduce((acc, t) => acc + (t.profitUSD ?? 0), 0);
   const activeAccountBalance = accountMetrics?.balance ?? activeAccount?.balance ?? 0;
   const activeAccountHasPositions = (accountMetrics?.openPositionsCount ?? accountLiveTrades.length) > 0;
@@ -415,10 +473,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     : activeAccountEquity;
   const activeAccountMarginLevel = activeAccountHasPositions ? accountMetrics?.marginLevel : null;
   const netProfitUSD = +((closedProfitUSD + liveProfitUSD) || currentUser.totalProfitUSD || 0).toFixed(2);
-  const totalPips = +((accountClosedTrades.reduce((acc, t) => acc + (t.pips ?? 0), 0) + accountLiveTrades.reduce((acc, t) => acc + (t.pips ?? 0), 0)) || currentUser.totalPips || 0).toFixed(1);
+  const totalPips = +(((agg?.totalPips ?? accountClosedTrades.reduce((acc, t) => acc + (t.pips ?? 0), 0)) + accountLiveTrades.reduce((acc, t) => acc + (t.pips ?? 0), 0)) || currentUser.totalPips || 0).toFixed(1);
 
   return (
-    <div className="w-full max-w-md mx-auto pb-24 px-3 sm:px-0 space-y-3.5">
+    <div className="w-full max-w-md mx-auto pb-40 px-3 sm:px-0 space-y-3.5">
       
       {/* Dashboard Top Header */}
       <div className="pt-2 pb-1 flex items-center justify-between">
@@ -485,13 +543,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </button>
         <button
           onClick={() => setActiveTab('portfolio')}
+          data-testid="dashboard-tab-portfolio"
           className={`flex-1 py-2 text-xs font-bold rounded-xl transition-all cursor-pointer ${
             activeTab === 'portfolio'
               ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
               : 'text-neutral-400 hover:text-neutral-200'
           }`}
         >
-          Portofolio ({accountClosedTrades.length})
+          Portofolio ({portfolioData?.total ?? accountClosedTrades.length})
         </button>
       </div>
 
@@ -504,24 +563,42 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <div className="flex justify-between items-start">
               <div>
                 <span className="text-[11px] text-neutral-400 uppercase font-bold tracking-wider">
-                  {currentUser.cTraderConnected ? 'Total Equity & Profit Bersih' : 'Total Profit / Loss Bersih'}
+                  {currentUser.cTraderConnected && activeAccountHasPositions ? 'Total Equity & Profit Bersih' : 'Total Profit / Loss Bersih'}
                 </span>
                 <div className="flex items-baseline gap-2 mt-0.5">
-                  <span className="text-2xl font-black font-mono text-emerald-400">
-                    ${activeAccountEquity.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-                  </span>
-                  <span className={`text-xs font-mono font-bold ${activeAccountFloating >= 0 ? 'text-emerald-300' : 'text-rose-400'}`}>
-                    (Floating: {activeAccountFloating >= 0 ? '+' : ''}${activeAccountFloating.toFixed(2)})
-                  </span>
+                  {currentUser.cTraderConnected && activeAccountHasPositions ? (
+                    <>
+                      <span className="text-2xl font-black font-mono text-emerald-400">
+                        ${activeAccountEquity.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                      </span>
+                      <span className={`text-xs font-mono font-bold ${activeAccountFloating >= 0 ? 'text-emerald-300' : 'text-rose-400'}`}>
+                        (Floating: {activeAccountFloating >= 0 ? '+' : ''}${activeAccountFloating.toFixed(2)})
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <span data-testid="summary-net-profit" className={`text-2xl font-black font-mono ${netProfitUSD >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {netProfitUSD >= 0 ? '+' : '-'}${Math.abs(netProfitUSD).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                      </span>
+                      <span className={`text-xs font-mono font-bold ${totalPips >= 0 ? 'text-emerald-300' : 'text-rose-400'}`}>
+                        ({totalPips >= 0 ? '+' : ''}{totalPips} pips)
+                      </span>
+                    </>
+                  )}
                 </div>
               </div>
               <div className="text-right">
                 <span className="text-[11px] text-neutral-400 uppercase font-bold tracking-wider">
                   Win Rate
                 </span>
-                <span className="text-xl font-black text-amber-300 block font-mono">
+                <span data-testid="summary-win-rate" className="text-xl font-black text-amber-300 block font-mono">
                   {winRate}%
                 </span>
+                {agg && (
+                  <span data-testid="summary-win-loss" className="text-[10px] text-neutral-500 font-mono block">
+                    {agg.winningTrades}W / {agg.losingTrades}L
+                  </span>
+                )}
               </div>
             </div>
 
@@ -537,7 +614,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </div>
               <div className="bg-[#161616] p-2.5 rounded-xl border border-[#222222]">
                 <span className="text-[10px] text-neutral-400 block font-sans">Win / Loss</span>
-                <span className="text-sm font-bold text-white">{winningTrades.length} / {accountClosedTrades.length - winningTrades.length}</span>
+                <span data-testid="summary-win-loss-grid" className="text-sm font-bold text-white">{winsFromServer} / {lossesFromServer}</span>
               </div>
             </div>
           </div>
@@ -787,24 +864,24 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       )}
 
-      {/* Tab 3: Portofolio (Closed Trades) */}
+      {/* Tab 3: Portofolio (Closed Trades) — server-paginated 20/page */}
       {activeTab === 'portfolio' && (() => {
-        const sortedClosed = [...accountClosedTrades].sort((a, b) => {
-          const at = new Date(a.closeTime || a.openTime || 0).getTime();
-          const bt = new Date(b.closeTime || b.openTime || 0).getTime();
-          return bt - at;
-        });
-        const totalPages = Math.max(1, Math.ceil(sortedClosed.length / PORTFOLIO_PAGE_SIZE));
+        const total = portfolioData?.total ?? 0;
+        const totalPages = portfolioData?.totalPages ?? 1;
         const currentPage = Math.min(portfolioPage, totalPages);
         const startIdx = (currentPage - 1) * PORTFOLIO_PAGE_SIZE;
-        const pageItems = sortedClosed.slice(startIdx, startIdx + PORTFOLIO_PAGE_SIZE);
+        const pageItems = portfolioData?.trades ?? [];
         return (
         <div className="space-y-2.5">
           <div className="flex justify-between items-center px-1 mb-1 text-xs text-neutral-400">
-            <span data-testid="portfolio-summary">Riwayat ({accountClosedTrades.length}) Trade Terakhir</span>
+            <span data-testid="portfolio-summary">Riwayat ({total}) Trade Terakhir</span>
             <span>Realized P/L</span>
           </div>
-          {sortedClosed.length === 0 ? (
+          {portfolioLoading && total === 0 ? (
+            <div className="text-center py-10 bg-[#111111] rounded-2xl border border-[#1f1f1f] p-4 text-xs text-neutral-400">
+              Memuat riwayat portofolio…
+            </div>
+          ) : pageItems.length === 0 ? (
             <div className="text-center py-10 bg-[#111111] rounded-2xl border border-[#1f1f1f] p-4 text-xs text-neutral-400">
               Belum ada riwayat transaksi selesai untuk akun cTrader ini.
             </div>
@@ -855,18 +932,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <button
                     data-testid="portfolio-prev-page"
                     onClick={() => { triggerHaptic('light'); setPortfolioPage((p) => Math.max(1, p - 1)); }}
-                    disabled={currentPage === 1}
+                    disabled={currentPage === 1 || portfolioLoading}
                     className="px-3 py-1.5 rounded-lg bg-[#141414] hover:bg-[#1f1f1f] disabled:opacity-40 disabled:cursor-not-allowed text-neutral-300 border border-[#222222] text-[11px] font-bold cursor-pointer"
                   >
                     ← Prev
                   </button>
                   <span data-testid="portfolio-page-indicator" className="text-[11px] text-neutral-400 font-mono">
-                    Halaman {currentPage} / {totalPages} • {startIdx + 1}–{Math.min(startIdx + PORTFOLIO_PAGE_SIZE, sortedClosed.length)} dari {sortedClosed.length}
+                    Halaman {currentPage} / {totalPages} • {startIdx + 1}–{Math.min(startIdx + PORTFOLIO_PAGE_SIZE, total)} dari {total}
                   </span>
                   <button
                     data-testid="portfolio-next-page"
                     onClick={() => { triggerHaptic('light'); setPortfolioPage((p) => Math.min(totalPages, p + 1)); }}
-                    disabled={currentPage === totalPages}
+                    disabled={currentPage === totalPages || portfolioLoading}
                     className="px-3 py-1.5 rounded-lg bg-[#141414] hover:bg-[#1f1f1f] disabled:opacity-40 disabled:cursor-not-allowed text-neutral-300 border border-[#222222] text-[11px] font-bold cursor-pointer"
                   >
                     Next →

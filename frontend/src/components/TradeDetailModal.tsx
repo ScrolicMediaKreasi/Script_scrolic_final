@@ -17,6 +17,7 @@ import { FeedPost, User } from '../types';
 import { PositionProgressBar } from './PositionProgressBar';
 import { formatPrice, maskPartialPrice } from '../utils/formatters';
 import { updateSEOForFeedPost } from '../utils/seo';
+import { getStrategy } from '../data/strategies';
 
 interface TradeDetailModalProps {
   post: FeedPost | null;
@@ -43,13 +44,50 @@ export const TradeDetailModal: React.FC<TradeDetailModalProps> = ({
 
   if (!post) return null;
 
-  const { user, trade, strategy } = post;
-  const isPremiumUser = user.subscriptionTier && user.subscriptionTier !== 'free';
-  const isOwner = Boolean(currentUser && currentUser.id === post.userId);
-  const isBuy = trade.direction === 'BUY';
-  const isProfit = (trade?.profitUSD ?? 0) >= 0;
-  const isOpen = trade.status === 'OPEN';
-  const isUnlocked = post.isUnlocked || isOwner || trade.status === 'CLOSED';
+  const user = post.user || {
+    id: post.userId || 'trader',
+    username: post.username || 'trader',
+    displayName: post.username || 'Trader',
+    avatar: post.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80',
+    subscriptionTier: 'free',
+    isVerified: false,
+    role: 'user',
+    winRate: 0,
+    totalTrades: 0,
+    followersCount: 0,
+    followingCount: 0,
+    energyBalance: 0,
+    referralCode: ''
+  };
+
+  const trade = post.trade || {
+    id: post.trade_id || post.id,
+    cTraderPositionId: post.trade_id || post.id || 'pos-881',
+    accountId: post.account_id || '',
+    userId: post.user_id || post.userId || '',
+    symbol: post.symbol || 'XAUUSD',
+    direction: post.position_type || 'BUY',
+    volumeLot: post.lot || 1.0,
+    entryPrice: post.entry_price || 0,
+    currentPrice: post.current_price || post.entry_price || 0,
+    stopLoss: post.stop_loss || 0,
+    takeProfit: post.take_profit || 0,
+    profitUSD: post.profit || 0,
+    profitPercent: post.profit_percent || 0,
+    pips: post.pips || 0,
+    openTime: post.opened_at || new Date().toISOString(),
+    duration: post.duration || 'Live',
+    status: post.status || 'OPEN',
+    strategyId: post.strategy_id || 'breakout'
+  };
+
+  const strategy = post.strategy || getStrategy(post.strategy_id || trade.strategyId || 'breakout');
+  const isPremiumUser = Boolean(user.subscriptionTier && user.subscriptionTier !== 'free');
+  const isOwner = Boolean(currentUser && (currentUser.id === post.userId || currentUser.username === user.username));
+  const isBuy = (trade.direction || 'BUY') === 'BUY';
+  const isProfit = (trade.profitUSD ?? 0) >= 0;
+  const isOpen = (trade.status || 'OPEN') === 'OPEN';
+  const isUnlocked = Boolean(post.isUnlocked || isOwner || trade.status === 'CLOSED');
 
   return (
     <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in duration-200">
@@ -81,7 +119,7 @@ export const TradeDetailModal: React.FC<TradeDetailModalProps> = ({
               }
             >
               <img 
-                src={user.avatar} 
+                src={user.avatar && user.avatar.trim() !== '' ? user.avatar : 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80'} 
                 alt={user.username} 
                 referrerPolicy="no-referrer"
                 className="w-10 h-10 rounded-full object-cover border border-[#2a2a2a]"
@@ -160,10 +198,10 @@ export const TradeDetailModal: React.FC<TradeDetailModalProps> = ({
 
             <div className="text-right">
               <div className={`text-xl font-bold font-mono ${isProfit ? 'text-emerald-400' : 'text-rose-400'}`}>
-                {isProfit ? '+' : ''}{(trade.pips ?? 0).toFixed(1)} Pips
+                {isProfit ? '+$' : '-$'}{Math.abs(trade.profitUSD ?? 0).toFixed(2)}
               </div>
               <div className="text-xs text-neutral-400 font-mono">
-                {isProfit ? '+$' : '-$'}{Math.abs(trade.profitUSD ?? 0).toFixed(2)} ({isProfit ? '+' : ''}{(trade.profitPercent ?? 0).toFixed(2)}%)
+                ({isProfit ? '+' : ''}{(trade.profitPercent ?? 0).toFixed(2)}%)
               </div>
             </div>
           </div>

@@ -17,6 +17,7 @@ import {
 import { User } from '../types';
 import { triggerHaptic } from '../utils/haptics';
 import { ScrolicLogo } from '../components/ScrolicLogo';
+import { safeAvatarUrl, handleAvatarError } from '../utils/avatar';
 
 interface PromotionViewProps {
   promoterUser: User | null;
@@ -35,9 +36,9 @@ export const PromotionView: React.FC<PromotionViewProps> = ({
 }) => {
   const [copied, setCopied] = useState(false);
   const promoter = promoterUser || currentUser || {
-    username: 'alex_trader',
-    displayName: 'Alex Sterling',
-    referralCode: 'SCROLIC50',
+    username: 'Master_Reversal',
+    displayName: 'Master Reversal',
+    referralCode: 'MASTER_REVERSAL',
     avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80',
     winRate: 81.4
   };
@@ -100,8 +101,9 @@ export const PromotionView: React.FC<PromotionViewProps> = ({
         <div className="p-3.5 rounded-2xl bg-[#0d2216] border border-emerald-500/20 flex items-center justify-between mb-5 text-left">
           <div className="flex items-center gap-3">
             <img 
-              src={promoter.avatar} 
+              src={safeAvatarUrl(promoter.avatar, promoter.username)} 
               alt={promoter.username} 
+              onError={(event) => handleAvatarError(event, promoter.username, promoter.avatar)}
               className="w-10 h-10 rounded-full object-cover border border-emerald-400/50"
             />
             <div>

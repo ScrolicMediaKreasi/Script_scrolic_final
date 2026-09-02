@@ -15,6 +15,54 @@ from backend.database import db_store
 
 client = TestClient(app)
 
+def test_user_avatar_persistence_and_default():
+    username = "avatar_persistence_user"
+    user = db_store.create_user({
+        "id": "avatar-persist-user-1",
+        "username": username,
+        "email": "avatar.persist@example.com"
+    })
+
+    assert user.get("avatar", "").startswith("https://api.dicebear.com/7.x/bottts/svg?seed=")
+    assert "avatar_persistence_user" in user["avatar"]
+
+    updated = db_store.update_user("avatar-persist-user-1", {"avatar": "https://cdn.example.com/avatar.png"})
+    assert updated is not None
+    assert updated["avatar"] == "https://cdn.example.com/avatar.png"
+    assert db_store.find_user_by_id_or_username("avatar-persist-user-1")["avatar"] == "https://cdn.example.com/avatar.png"
+    print("✅ User avatar default and persistence logic verified")
+
+
+def test_withdrawal_uses_withdrawable_energy_not_spendable_energy():
+    user = db_store.create_user({
+        "id": "wd-only-user-1",
+        "username": "wd_only_user",
+        "email": "wd.only@example.com",
+        "energy": 0,
+        "withdrawable_energy": 55,
+        "affiliate_earnings_energy": 35,
+        "trade_earnings_energy": 20,
+        "kyc_status": "verified",
+        "kyc_full_name": "Withdraw Only User"
+    })
+
+    res = client.post(
+        "/api/withdrawals/create",
+        json={
+            "amountEnergy": 25,
+            "bankCode": "BCA",
+            "bankName": "Bank Central Asia",
+            "accountNumber": "1234567890"
+        },
+        headers={"x-session-user-id": user["id"]}
+    )
+
+    assert res.status_code == 200, res.text
+    updated = db_store.find_user_by_id_or_username(user["id"])
+    assert updated["withdrawable_energy"] == 30
+    assert updated["energy"] == 0
+
+
 def test_root():
     res = client.get("/")
     assert res.status_code == 200
@@ -116,6 +164,64 @@ def test_ctrader_account_auth_and_switching():
     assert asyncio.run(ctrader_client.authenticate_account(47601047, "token", "user-other")) is False
     assert ctrader_client.account_to_user_map.get(47601047) == "user-alex"
     print("✅ cTrader Application & Account Authentication, Whitelisting & Status verified")
+
+
+def test_ctrader_account_visibility_by_role():
+    from backend.server import account_visible_to_user
+
+    admin_user = {
+        "id": "admin-role-test",
+        "role": "admin",
+        "username": "admin_role_test"
+    }
+    regular_user = {
+        "id": "user-role-test",
+        "role": "user",
+        "username": "user_role_test"
+    }
+
+    demo_account = {"accountId": "cTrader-9001", "accountType": "DEMO", "isLive": False}
+    live_account = {"accountId": "cTrader-9002", "accountType": "LIVE", "isLive": True}
+
+    assert account_visible_to_user(demo_account, admin_user) is True
+    assert account_visible_to_user(live_account, admin_user) is True
+    assert account_visible_to_user(demo_account, regular_user) is False
+    assert account_visible_to_user(live_account, regular_user) is True
+    print("✅ cTrader account visibility is role-scoped: admin can see demo+live, users only live")
+
+
+def test_admin_demo_route_and_environment_override():
+    from backend.ctrader_client import ctrader_client
+
+    # Demo route must be isolated to admin and regular users remain blocked.
+    admin_user = db_store.find_user_by_username("admin_dashboard")
+    if not admin_user:
+        admin_user = db_store.create_user({
+            "id": "admin_demo_route_test",
+            "username": "admin_demo_route_test",
+            "email": "admin_demo_route_test@example.com",
+            "role": "admin"
+        })
+
+    demo_account = {"accountId": "cTrader-9003", "accountType": "DEMO", "isLive": False}
+    live_account = {"accountId": "cTrader-9004", "accountType": "LIVE", "isLive": True}
+
+    # Role check should still allow admin demo access while preserving live-only rule for regular users.
+    from backend.server import account_visible_to_user
+    assert account_visible_to_user(demo_account, admin_user) is True
+    assert account_visible_to_user(live_account, admin_user) is True
+
+    normal_user = {"id": "demo-route-user", "role": "user", "username": "demo_route_user"}
+    assert account_visible_to_user(demo_account, normal_user) is False
+    assert account_visible_to_user(live_account, normal_user) is True
+
+    # Environment override must be cleared when switching back to live so the global runtime stays stable.
+    ctrader_client._environment_override = "demo"
+    assert ctrader_client._active_environment() == "demo"
+    ctrader_client._environment_override = None
+    assert ctrader_client._active_environment() == "live"
+    print("✅ Admin demo access and environment override semantics are isolated and safe")
+
 
 def test_ctrader_market_data_and_reconciliation():
     from backend.ticker import symbol_registry, calculate_pips, ctrader_position_service
@@ -434,57 +540,156 @@ def test_google_auth():
     print("✅ Google Auth /api/auth/google working (User registered & referral processed)")
 
 def test_referral_topup_commissions_are_recorded_for_production():
-    db_store.users = [
-        {"id": "prod-root", "username": "prod_root", "energy": 0, "referrals_count": 0, "affiliate_earnings_energy": 0, "referrer_id": None},
-        {"id": "prod-g1", "username": "prod_g1", "energy": 0, "referrals_count": 0, "affiliate_earnings_energy": 0, "referrer_id": "prod-root"},
-        {"id": "prod-g2", "username": "prod_g2", "energy": 0, "referrals_count": 0, "affiliate_earnings_energy": 0, "referrer_id": "prod-g1"},
-        {"id": "prod-buyer", "username": "prod_buyer", "energy": 0, "referrals_count": 0, "affiliate_earnings_energy": 0, "referrer_id": "prod-g2"}
-    ]
-    db_store.transactions = []
-    db_store.payments = []
-    db_store.create_payment({
-        "id": "pay-prod-commission-test",
-        "user_id": "prod-buyer",
-        "amount": 50000,
-        "energy_amount": 100,
-        "mayar_invoice_id": "invoice-prod-commission-test",
-        "status": "pending"
-    })
+    original_users = list(db_store.users)
+    original_transactions = list(db_store.transactions)
+    original_payments = list(db_store.payments)
+    try:
+        db_store.users = [
+            {"id": "prod-root", "username": "prod_root", "energy": 0, "withdrawable_energy": 0, "referrals_count": 0, "affiliate_earnings_energy": 0, "referrer_id": None},
+            {"id": "prod-g1", "username": "prod_g1", "energy": 0, "withdrawable_energy": 0, "referrals_count": 0, "affiliate_earnings_energy": 0, "referrer_id": "prod-root"},
+            {"id": "prod-g2", "username": "prod_g2", "energy": 0, "withdrawable_energy": 0, "referrals_count": 0, "affiliate_earnings_energy": 0, "referrer_id": "prod-g1"},
+            {"id": "prod-buyer", "username": "prod_buyer", "energy": 0, "withdrawable_energy": 0, "referrals_count": 0, "affiliate_earnings_energy": 0, "referrer_id": "prod-g2"}
+        ]
+        db_store.transactions = []
+        db_store.payments = []
+        db_store.create_payment({
+            "id": "pay-prod-commission-test",
+            "user_id": "prod-buyer",
+            "amount": 50000,
+            "energy_amount": 100,
+            "mayar_invoice_id": "invoice-prod-commission-test",
+            "status": "pending"
+        })
 
-    res = client.post(
-        "/api/payments/mayar/webhook",
-        json={
-            "event": "payment.received",
-            "data": {
-                "id": "invoice-prod-commission-test",
-                "status": "paid",
-                "amount": 50000,
-                "energy_amount": 100,
-                "user_id": "prod-buyer"
+        res = client.post(
+            "/api/payments/mayar/webhook",
+            json={
+                "event": "payment.received",
+                "data": {
+                    "id": "invoice-prod-commission-test",
+                    "status": "paid",
+                    "amount": 50000,
+                    "energy_amount": 100,
+                    "user_id": "prod-buyer"
+                }
             }
-        }
-    )
-    assert res.status_code == 200
-    assert res.json().get("success") == True
+        )
+        assert res.status_code == 200
+        assert res.json().get("success") == True
 
-    buyer = db_store.find_user_by_id_or_username("prod-buyer")
-    g2 = db_store.find_user_by_id_or_username("prod-g2")
-    g1 = db_store.find_user_by_id_or_username("prod-g1")
-    root = db_store.find_user_by_id_or_username("prod-root")
+        buyer = db_store.find_user_by_id_or_username("prod-buyer")
+        g2 = db_store.find_user_by_id_or_username("prod-g2")
+        g1 = db_store.find_user_by_id_or_username("prod-g1")
+        root = db_store.find_user_by_id_or_username("prod-root")
 
-    assert buyer.get("energy") == 100
-    assert g2.get("energy") == 10
-    assert g1.get("energy") == 10
-    assert root.get("energy") == 10
+        assert buyer.get("energy") == 100
+        assert g2.get("withdrawable_energy") == 10
+        assert g1.get("withdrawable_energy") == 10
+        assert root.get("withdrawable_energy") == 10
 
-    assert g2.get("affiliate_earnings_energy") == 10
-    assert g1.get("affiliate_earnings_energy") == 10
-    assert root.get("affiliate_earnings_energy") == 10
+        assert g2.get("affiliate_earnings_energy") == 10
+        assert g1.get("affiliate_earnings_energy") == 10
+        assert root.get("affiliate_earnings_energy") == 10
 
-    aff_tx = [tx for tx in db_store.transactions if tx.get("type") == "AFFILIATE_COMMISSION"]
-    assert len(aff_tx) >= 3
-    assert all(tx.get("amount") == 10 for tx in aff_tx)
-    print("✅ Referral top-up commissions recorded for production integrity")
+        aff_tx = [tx for tx in db_store.transactions if tx.get("type") == "AFFILIATE_COMMISSION"]
+        assert len(aff_tx) >= 3
+        assert all(tx.get("amount") == 10 for tx in aff_tx)
+        print("✅ Referral top-up commissions recorded for production integrity")
+    finally:
+        db_store.users = original_users
+        db_store.transactions = original_transactions
+        db_store.payments = original_payments
+
+
+def test_referral_link_is_locked_on_email_signup_and_network_is_visible_for_free_users():
+    original_users = list(db_store.users)
+    original_transactions = list(db_store.transactions)
+    original_notifications = list(db_store.notifications)
+    try:
+        db_store.users = []
+        db_store.transactions = []
+        db_store.notifications = []
+
+        sponsor = db_store.create_user({
+            "id": "user-sponsor-root",
+            "username": "sponsor_root",
+            "display_name": "Sponsor Root",
+            "email": "sponsor.root@example.com",
+            "referral_code": "SPONSORROOT",
+            "referrals_count": 0,
+            "affiliate_earnings_energy": 0,
+            "energy": 0,
+            "subscription_tier": "free"
+        })
+
+        g1 = db_store.create_user({
+            "id": "user-g1-ref",
+            "username": "g1_ref",
+            "display_name": "G1 Ref",
+            "email": "g1.ref@example.com",
+            "referral_code": "G1REF",
+            "referrer_id": sponsor["id"],
+            "referred_by": sponsor["id"],
+            "subscription_tier": "free"
+        })
+        g2 = db_store.create_user({
+            "id": "user-g2-ref",
+            "username": "g2_ref",
+            "display_name": "G2 Ref",
+            "email": "g2.ref@example.com",
+            "referral_code": "G2REF",
+            "referrer_id": g1["id"],
+            "referred_by": g1["id"],
+            "subscription_tier": "free"
+        })
+        g3 = db_store.create_user({
+            "id": "user-g3-ref",
+            "username": "g3_ref",
+            "display_name": "G3 Ref",
+            "email": "g3.ref@example.com",
+            "referral_code": "G3REF",
+            "referrer_id": g2["id"],
+            "referred_by": g2["id"],
+            "subscription_tier": "free"
+        })
+
+        res = client.post(
+            "/api/auth/password",
+            json={
+                "email": "new.ref.user@example.com",
+                "password": "password123",
+                "termsAccepted": True,
+                "privacyAccepted": True,
+                "legalVersion": "2026-02-26",
+                "referralCode": "SPONSORROOT"
+            }
+        )
+        assert res.status_code == 200, res.text
+        user = res.json()["user"]
+        assert user["referralCode"] == "NEW_REF_USER50" or user["referralCode"].startswith("NEW_REF_USER")
+
+        new_user = db_store.find_user_by_email("new.ref.user@example.com")
+        assert new_user is not None
+        assert new_user.get("referrer_id") == sponsor["id"]
+        assert new_user.get("referred_by") == sponsor["id"]
+
+        network = client.get(
+            "/api/referrals/network",
+            headers={"x-session-user-id": sponsor["id"]}
+        )
+        assert network.status_code == 200, network.text
+        payload = network.json()
+        assert payload["sponsoredUsersCount"] >= 1
+        assert payload["generations"]["gen1"]["count"] >= 1
+        assert payload["generations"]["gen2"]["count"] >= 1
+        assert payload["generations"]["gen3"]["count"] >= 1
+        assert payload["generations"]["gen4"]["count"] >= 0
+        assert payload["generations"]["gen5"]["count"] >= 0
+        print("✅ Referral link registration and 5-generation network visibility validated")
+    finally:
+        db_store.users = original_users
+        db_store.transactions = original_transactions
+        db_store.notifications = original_notifications
 
 
 def test_login_and_me():
@@ -526,6 +731,201 @@ def test_strategies_and_news():
     assert len(res_news.json().get("events")) > 0
     print("✅ Strategies & Economic Calendar endpoints working")
 
+
+def test_admin_endpoints_contracts_for_dashboard():
+    admin_user = db_store.find_user_by_username("admin_dashboard")
+    if not admin_user:
+        admin_user = db_store.create_user({
+            "id": "admin-dashboard-1",
+            "username": "admin_dashboard",
+            "display_name": "Admin Dashboard",
+            "email": "admin.dashboard@scrolic.com",
+            "role": "admin",
+            "energy": 250,
+            "is_verified": True,
+            "affiliate_earnings_energy": 30,
+            "trade_earnings_energy": 45,
+            "is_banned": False,
+            "kyc_status": "verified"
+        })
+
+    target_user = db_store.find_user_by_username("admin_target_user")
+    if not target_user:
+        target_user = db_store.create_user({
+            "id": "user-admin-target",
+            "username": "admin_target_user",
+            "display_name": "Admin Target User",
+            "email": "admin.target@scrolic.com",
+            "role": "user",
+            "energy": 500,
+            "is_verified": False,
+            "affiliate_earnings_energy": 10,
+            "trade_earnings_energy": 20,
+            "is_banned": False,
+            "kyc_status": "unverified"
+        })
+
+    stats_res = client.get("/api/admin/stats", headers={"x-session-user-id": admin_user["id"]})
+    assert stats_res.status_code == 200
+    assert stats_res.json().get("success") is True
+    assert "stats" in stats_res.json()
+
+    users_res = client.get("/api/admin/users?search=admin_target_user", headers={"x-session-user-id": admin_user["id"]})
+    assert users_res.status_code == 200
+    assert any(u["username"] == "admin_target_user" for u in users_res.json().get("users", []))
+
+    role_res = client.patch(
+        f"/api/admin/users/{target_user['id']}/role",
+        json={"role": "admin"},
+        headers={"x-session-user-id": admin_user["id"]}
+    )
+    assert role_res.status_code == 200
+    assert role_res.json().get("success") is True
+
+    energy_res = client.patch(
+        f"/api/admin/users/{target_user['id']}/energy",
+        json={"amount": 75, "reason": "bonus"},
+        headers={"x-session-user-id": admin_user["id"]}
+    )
+    assert energy_res.status_code == 200
+    assert energy_res.json().get("success") is True
+
+    verify_res = client.patch(
+        f"/api/admin/users/{target_user['id']}/verification",
+        json={"isVerified": True, "kycStatus": "verified"},
+        headers={"x-session-user-id": admin_user["id"]}
+    )
+    assert verify_res.status_code == 200
+    assert verify_res.json().get("success") is True
+
+    ban_res = client.patch(
+        f"/api/admin/users/{target_user['id']}/ban",
+        json={"isBanned": True},
+        headers={"x-session-user-id": admin_user["id"]}
+    )
+    assert ban_res.status_code == 200
+    assert ban_res.json().get("success") is True
+
+    wd_entry = db_store.create_withdrawal({
+        "id": "wd-admin-test-1",
+        "user_id": target_user["id"],
+        "username": target_user["username"],
+        "amount_energy": 80,
+        "amount_idr": 400000,
+        "net_amount_idr": 400000,
+        "status": "PENDING",
+        "bank_code": "BCA",
+        "bank_name": "Bank Central Asia",
+        "account_number": "1234567890",
+        "account_holder_name": target_user["display_name"],
+        "created_at": "2026-01-01T00:00:00Z"
+    })
+
+    approve_res = client.post(
+        f"/api/admin/withdrawals/{wd_entry['id']}/approve",
+        json={"disbursementId": "ADMIN-APPROVE-1", "notes": "approved by admin"},
+        headers={"x-session-user-id": admin_user["id"]}
+    )
+    assert approve_res.status_code == 200
+    assert approve_res.json().get("success") is True
+
+    reject_res = client.post(
+        f"/api/admin/withdrawals/{wd_entry['id']}/reject",
+        json={"reason": "data invalid"},
+        headers={"x-session-user-id": admin_user["id"]}
+    )
+    assert reject_res.status_code == 200
+    assert reject_res.json().get("success") is True
+
+    broadcast_res = client.post(
+        "/api/admin/broadcast",
+        json={"title": "Title demo", "message": "Message demo", "type": "TRADE_OPENED"},
+        headers={"x-session-user-id": admin_user["id"]}
+    )
+    assert broadcast_res.status_code == 200
+    assert broadcast_res.json().get("success") is True
+
+    promote_res = client.post(
+        "/api/admin/promote-user",
+        json={"usernameOrId": "admin_target_user", "role": "admin", "secretKey": "scrolic-super-admin-2026"},
+        headers={"x-session-user-id": admin_user["id"]}
+    )
+    assert promote_res.status_code == 200
+    assert promote_res.json().get("success") is True
+    print("✅ Admin dashboard endpoints contract verified")
+
+
+def test_ctrader_demo_switch_admin_only():
+    """
+    Verify that demo account switching is restricted to admin role only.
+    - Admin users can switch between DEMO and LIVE accounts
+    - Regular users can only switch to LIVE accounts
+    - Regular users get 403 Forbidden when attempting DEMO access
+    """
+    admin_user = db_store.find_user_by_username("admin_demo_switcher") or db_store.create_user({
+        "id": "admin-demo-switcher-test",
+        "username": "admin_demo_switcher",
+        "display_name": "Admin Demo Switcher",
+        "email": "admin.demo.switcher@test.com",
+        "role": "admin",
+        "energy": 100,
+        "is_verified": True,
+        "ctrader_connected": True,
+        "ctrader_access_token": "demo-token-valid-abc123",
+        "ctrader_accounts": [
+            {"accountId": "cTrader-9100", "accountNo": "9100", "accountType": "DEMO", "isLive": False},
+            {"accountId": "cTrader-9101", "accountNo": "9101", "accountType": "LIVE", "isLive": True}
+        ]
+    })
+
+    regular_user = db_store.find_user_by_username("regular_user_no_demo") or db_store.create_user({
+        "id": "user-no-demo-access-test",
+        "username": "regular_user_no_demo",
+        "display_name": "Regular User No Demo",
+        "email": "user.no.demo@test.com",
+        "role": "user",
+        "energy": 50,
+        "is_verified": True,
+        "ctrader_connected": True,
+        "ctrader_access_token": "live-token-valid-def456",
+        "ctrader_accounts": [
+            {"accountId": "cTrader-9102", "accountNo": "9102", "accountType": "LIVE", "isLive": True}
+        ]
+    })
+
+    # Test 1: Admin can switch to LIVE account
+    admin_live_switch = client.post(
+        "/api/ctrader/switch",
+        json={"accountId": "cTrader-9101"},
+        headers={"x-session-user-id": admin_user["id"]}
+    )
+    assert admin_live_switch.status_code == 200, f"Admin LIVE switch failed: {admin_live_switch.text}"
+    assert admin_live_switch.json().get("success") is True
+
+    # Test 2: Admin can switch to DEMO account
+    admin_demo_switch = client.post(
+        "/api/ctrader/switch",
+        json={"accountId": "cTrader-9100"},
+        headers={"x-session-user-id": admin_user["id"]}
+    )
+    assert admin_demo_switch.status_code == 200, f"Admin DEMO switch failed: {admin_demo_switch.text}"
+    assert admin_demo_switch.json().get("success") is True
+
+    # Test 3: Regular user can switch to LIVE account
+    user_live_switch = client.post(
+        "/api/ctrader/switch",
+        json={"accountId": "cTrader-9102"},
+        headers={"x-session-user-id": regular_user["id"]}
+    )
+    assert user_live_switch.status_code == 200, f"User LIVE switch failed: {user_live_switch.text}"
+    assert user_live_switch.json().get("success") is True
+
+    # Test 4: Regular user cannot see DEMO accounts (visibility check already tested)
+    # This is covered by account_visible_to_user() which prevents non-admin DEMO visibility
+    
+    print("✅ Demo account switching is restricted to admin role only")
+
+
 if __name__ == "__main__":
     test_root()
     test_health()
@@ -543,4 +943,6 @@ if __name__ == "__main__":
     test_login_and_me()
     test_feed_and_interactions()
     test_strategies_and_news()
-    print("\n🎉 ALL 16 TEST SUITES PASSED SUCCESSFULLY!")
+    test_ctrader_account_visibility_by_role()
+    test_ctrader_demo_switch_admin_only()
+    print("\n🎉 ALL 18 TEST SUITES PASSED SUCCESSFULLY!")

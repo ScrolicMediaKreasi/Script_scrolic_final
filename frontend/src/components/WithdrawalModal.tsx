@@ -67,11 +67,11 @@ export const WithdrawalModal: React.FC<WithdrawalModalProps> = ({
 
   const affiliateEnergy = currentUser?.affiliateEarningsEnergy || 0;
   const tradeEnergy = currentUser?.tradeEarningsEnergy || 0;
-  // Total withdrawable commission (Energy and IDR: 1 Energy = Rp 500)
+  // Total withdrawable commission (Energy and IDR: 1 Energy = Rp 1000)
   const availableEnergy = Math.max(currentUser?.energyBalance || 0, affiliateEnergy + tradeEnergy);
-  const availableRp = availableEnergy * 500;
+  const availableRp = availableEnergy * 1000;
 
-  const currentAmountRp = amountEnergy * 500;
+  const currentAmountRp = amountEnergy * 1000;
   const adminFeeRp = 0; // Promo Free BI-FAST
   const netAmountRp = currentAmountRp - adminFeeRp;
 
@@ -243,7 +243,7 @@ export const WithdrawalModal: React.FC<WithdrawalModalProps> = ({
                     Saldo Komisi Tersedia untuk Ditarik
                   </span>
                   <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono text-[10px] font-bold border border-emerald-500/30">
-                    1⚡ = Rp 500
+                    1⚡ = Rp 1000
                   </span>
                 </div>
                 <div className="mt-2 flex items-baseline justify-between">
@@ -334,7 +334,7 @@ export const WithdrawalModal: React.FC<WithdrawalModalProps> = ({
                     >
                       <span className="text-xs font-bold block">{energy} Energy</span>
                       <span className="text-[10px] text-neutral-400 block mt-0.5">
-                        Rp {(energy * 500).toLocaleString('id-ID')}
+                        Rp {(energy * 1000).toLocaleString('id-ID')}
                       </span>
                     </button>
                   ))}

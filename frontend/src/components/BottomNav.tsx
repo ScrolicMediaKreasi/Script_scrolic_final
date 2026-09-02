@@ -2,7 +2,7 @@ import React from 'react';
 import { Home, Compass, BarChart3, Newspaper, User as UserIcon } from 'lucide-react';
 import { triggerHaptic } from '../utils/haptics';
 
-export type NavTab = 'feed' | 'explore' | 'dashboard' | 'news' | 'profile';
+export type NavTab = 'feed' | 'explore' | 'dashboard' | 'news' | 'profile' | 'notifications';
 
 interface BottomNavProps {
   currentTab: NavTab;

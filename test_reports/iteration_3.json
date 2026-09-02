@@ -1,0 +1,24 @@
+{
+  "summary": "Iteration 3 frontend-only verification of the two small DashboardView fixes for Scrolic @ptsmiea (mobile 390x844, auto-login via scrolic_uid cookie + scrolic_user_id localStorage set before goto). Both HIGH-priority iteration-2 items are FIXED and all requested regressions pass. No backend pytest re-run (no backend changes). 5/5 frontend checks PASS.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Dashboard Portfolio tab", "issues": ["pb-40 works: pagination footer now clears bottom-nav + PWA install banner and the Next button is clickable without force. Note the footer row still sits directly above the install banner with only a small gap - visually tight but functional."]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_closed_trades.py"],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Still open from iteration 2 (not part of this scope, unverified): react-hooks/rules-of-hooks violation - useState('switchingAccountId') in DashboardView is declared AFTER the early `if (!currentUser) return <LoginRequiredGate/>` return, which changes hook order between renders and can crash on logout while on Dashboard."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "not tested (no backend changes)", "frontend": "100% (5/5 checks)"},
+  "seed_data_creation": "none",
+  "should_call_test_agent_after_fix": false,
+  "should_main_agent_self_test": false,
+  "test_credentials": "UI: cookie scrolic_uid=user-ptsmiea + localStorage scrolic_user_id=user-ptsmiea (set before goto). API: header x-session-user-id: user-ptsmiea",
+  "context_for_next_testing_agent": "Verified results: [data-testid=summary-net-profit] = '-$1,117.30' with class text-rose-400 (minus-sign fix confirmed); summary-win-rate='49.2%'; summary-win-loss='94W / 97L'; portfolio-summary='Riwayat (191) Trade Terakhir'; pagination indicator 'Halaman 1 / 10 - 1-20 dari 191' (20 rows) -> normal (non-force) click on portfolio-next-page succeeded in <5s -> 'Halaman 2 / 10 - 21-40 dari 191' (20 rows) -> paged through to 'Halaman 10 / 10 - 181-191 dari 191' (11 rows) with Next correctly disabled. Feed PositionProgressBar regression OK: 8 progress elements, 2-decimal badge ('-0.20% Position'), no red risk zone when SL is '-'. Only observation: on very first load a few transient 'TypeError: Failed to fetch' console warnings appear for /api/feed, /api/notifications, /api/user/me, /api/users (during the automation tool's navigation retries); all data rendered correctly afterwards, so treated as transient, not a defect. As instructed, the negative-$/positive-pips rows were NOT re-reported (expected real broker swap/commission data).",
+  "rca_of_the_issue": "Iteration 2 defects resolved as intended: the '-' prefix in the netProfitUSD ternary restores the minus sign, and pb-40 on the DashboardView container adds enough bottom scroll padding so the fixed bottom-nav/PWA banner no longer intercepts pointer events on the pagination footer."
+}

@@ -267,9 +267,13 @@ class CTraderClient:
             self.metrics["connected_at"] = datetime.now(timezone.utc).isoformat()
         elif new_state == CTraderConnectionState.AUTHENTICATED:
             self.metrics["authenticated_at"] = datetime.now(timezone.utc).isoformat()
-        elif new_state == CTraderConnectionState.RECONNECTING:
-            self.metrics["reconnect_count"] += 1
+        elif new_state in (CTraderConnectionState.RECONNECTING, CTraderConnectionState.DISCONNECTED):
+            if new_state == CTraderConnectionState.RECONNECTING:
+                self.metrics["reconnect_count"] += 1
             self._app_authenticated_event.clear()
+            for acct_num, info in list(self.account_states.items()):
+                if isinstance(info, dict):
+                    info["authStatus"] = AccountAuthStatus.UNAUTHENTICATED.value
             
         logger.info(f"[cTrader.Lifecycle] State changed: {prev.value} -> {new_state.value}" + (f" ({error_msg})" if error_msg else ""))
         self._notify_event("state_change", {"from": prev.value, "to": new_state.value, "error": error_msg})
@@ -318,6 +322,14 @@ class CTraderClient:
             "lastReconciledAt": None,
             "lastError": None
         }
+
+    def is_account_authenticated(self, account_id: Any) -> bool:
+        """Returns True if the specified account is fully AUTHENTICATED on the active connection."""
+        clean_num = self._clean_numeric_account_id(account_id)
+        if not clean_num:
+            return False
+        st = self.account_states.get(clean_num, {})
+        return st.get("authStatus") == AccountAuthStatus.AUTHENTICATED.value and self._app_authenticated_event.is_set()
 
     def _clean_numeric_account_id(self, raw_id: Any) -> int:
         """Parses clean numeric int from account ID (e.g. 'cTrader-47601047' -> 47601047)."""
@@ -510,6 +522,40 @@ class CTraderClient:
             "[cTrader.Auth] account auth start user_id=%s ctidTraderAccountId=%s state=%s requestId=%s timestamp=%s accessTokenAvailable=%s",
             user_id, acct_num, self.state.value, request_id, timestamp, bool(access_token)
         )
+        try:
+            authorized_accounts = await self.get_accounts_by_access_token(access_token)
+        except Exception as exc:
+            authorized_accounts = []
+            logger.warning(
+                "[cTrader.Auth] Account authorization preflight unavailable for ctidTraderAccountId=%s requestId=%s: %s",
+                acct_num, request_id, exc
+            )
+        if authorized_accounts:
+            authorized_ids = {
+                self._clean_numeric_account_id(
+                    account.get("ctidTraderAccountId")
+                    or account.get("accountId")
+                    or account.get("accountNo")
+                )
+                for account in authorized_accounts
+                if isinstance(account, dict)
+            }
+            if acct_num not in authorized_ids:
+                error_message = f"Trading account {acct_num} is not authorized for the supplied access token"
+                self.account_states.setdefault(acct_num, {}).update({
+                    "ctidTraderAccountId": acct_num,
+                    "accountId": f"cTrader-{acct_num}",
+                    "userId": user_id,
+                    "authStatus": AccountAuthStatus.FAILED.value,
+                    "lastError": error_message,
+                    "lastRequestId": request_id,
+                    "lastAuthAttemptAt": timestamp
+                })
+                logger.warning(
+                    "[cTrader.Auth] Skipping unauthorized account ctidTraderAccountId=%s user_id=%s requestId=%s",
+                    acct_num, user_id, request_id
+                )
+                return False
         if existing_owner and user_id and existing_owner != user_id:
             warning = f"WARNING: Akun cTrader {acct_num} sudah digunakan oleh user lain dan tidak dapat dihubungkan."
             self.account_states.setdefault(acct_num, {}).update({
@@ -544,6 +590,36 @@ class CTraderClient:
             self.account_to_user_map[acct_num] = user_id
         self.account_tokens[acct_num] = access_token
         
+        # Check if caller is Admin with a Demo account -> Dedicated Demo Route
+        target_user = db_store.find_user_by_id_or_username(user_id or existing_owner or "")
+        is_admin_user = str((target_user or {}).get("role", "")).lower() == "admin"
+        
+        target_acct_obj = next(
+            (a for a in (target_user or {}).get("ctrader_accounts", [])
+             if self._clean_numeric_account_id(a.get("accountId") or a.get("accountNo")) == acct_num),
+            None
+        )
+        is_demo_account = bool(
+            (target_acct_obj or {}).get("accountType") == "DEMO" 
+            or (target_acct_obj or {}).get("isLive") is False
+        )
+
+        account_env = "demo" if (is_admin_user and is_demo_account) or is_demo_account else get_ctrader_env()
+
+        if is_admin_user and is_demo_account:
+            logger.info(
+                f"[cTrader.AdminDemo] Admin @{(target_user or {}).get('username')} connected Demo account {acct_num}. Routing via dedicated Demo environment cluster (demo.ctraderapi.com)..."
+            )
+            if self._active_environment() != "demo":
+                self._environment_override = "demo"
+                await self._close_transport()
+                self._app_authenticated_event.clear()
+                try:
+                    await asyncio.wait_for(self._app_authenticated_event.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.error(f"[cTrader.AdminDemo] Dedicated Demo environment reconnect timed out for Admin account {acct_num}")
+                    return False
+
         # Initialize account state
         self.account_states[acct_num] = {
             "ctidTraderAccountId": acct_num,
@@ -551,7 +627,8 @@ class CTraderClient:
             "accountNo": str(acct_num),
             "userId": user_id or self.account_to_user_map.get(acct_num, ""),
             "authStatus": AccountAuthStatus.PENDING.value,
-            "environment": get_ctrader_env(),
+            "environment": account_env,
+            "isAdminDemo": is_admin_user and is_demo_account,
             "authenticatedAt": None,
             "lastReconciledAt": None,
             "lastError": None,
@@ -602,6 +679,14 @@ class CTraderClient:
                 "[cTrader.Auth] Account auth failed user_id=%s ctidTraderAccountId=%s state=%s requestId=%s timestamp=%s accessTokenAvailable=%s error=%s",
                 user_id, acct_num, self.state.value, request_id, datetime.now(timezone.utc).isoformat(), bool(access_token), exc
             )
+            target_uid = user_id or existing_owner
+            if target_uid and ("INVALID" in str(exc).upper() or "TOKEN" in str(exc).upper() or "AUTHORIZED" in str(exc).upper()) and "CANT_ROUTE_REQUEST" not in str(exc).upper():
+                try:
+                    from backend.ctrader_oauth import refresh_user_token
+                    logger.info(f"[cTrader.Auth] Triggering token refresh for user {target_uid} due to auth failure: {exc}")
+                    asyncio.create_task(refresh_user_token(target_uid))
+                except Exception as r_err:
+                    logger.warning(f"[cTrader.Auth] Failed to trigger background token refresh: {r_err}")
             return False
         finally:
             self._account_auth_futures.pop(acct_num, None)
@@ -633,6 +718,7 @@ class CTraderClient:
             return False
 
         target_user = db_store.find_user_by_id_or_username(user_id)
+        is_admin_user = str((target_user or {}).get("role", "")).lower() == "admin"
         target_account = next(
             (account for account in (target_user or {}).get("ctrader_accounts", [])
              if self._clean_numeric_account_id(account.get("accountId") or account.get("accountNo")) == new_num),
@@ -641,6 +727,9 @@ class CTraderClient:
         target_account_type = str((target_account or {}).get("accountType", "")).upper()
         target_is_live = (target_account or {}).get("isLive")
         target_environment = "demo" if target_account_type == "DEMO" or target_is_live is False else "live"
+        
+        if is_admin_user and target_environment == "demo":
+            logger.info(f"[cTrader.AdminDemo] Dedicated Demo route activated: Switching Admin @{(target_user or {}).get('username')} to Demo environment for account {new_num}")
         existing_owner = self.account_to_user_map.get(new_num)
         if existing_owner and existing_owner != user_id:
             logger.warning(f"[cTrader.Switch] Account {new_num} belongs to another user; refusing switch.")
@@ -687,6 +776,10 @@ class CTraderClient:
             logger.error(f"[cTrader.Order] Invalid account ID: {account_id}")
             return False
 
+        if not self.is_account_authenticated(acct_num):
+            logger.warning(f"[cTrader.Order] Account {acct_num} is not authenticated. Refusing order request.")
+            return False
+
         try:
             await self.ensure_app_authenticated()
         except Exception as e:
@@ -723,6 +816,10 @@ class CTraderClient:
             logger.error(f"[cTrader.Close] Invalid account ({account_id}) or position ({position_id}) ID.")
             return False
 
+        if not self.is_account_authenticated(acct_num):
+            logger.warning(f"[cTrader.Close] Account {acct_num} is not authenticated. Refusing close position request.")
+            return False
+
         try:
             await self.ensure_app_authenticated()
         except Exception as e:
@@ -748,7 +845,7 @@ class CTraderClient:
         Sends official ProtoOADealListReq (2133) to retrieve deal history within timestamp range.
         """
         acct_num = self._clean_numeric_account_id(account_id)
-        if not acct_num:
+        if not acct_num or not self.is_account_authenticated(acct_num):
             return
         await self.send_message(PROTO_OA_DEAL_LIST_REQ, {
             "ctidTraderAccountId": acct_num,
@@ -759,7 +856,7 @@ class CTraderClient:
 
     async def request_position_unrealized_pnl(self, account_id: Any):
         acct_num = self._clean_numeric_account_id(account_id)
-        if not acct_num:
+        if not acct_num or not self.is_account_authenticated(acct_num):
             return
         await self.send_message(PROTO_OA_GET_POSITION_UNREALIZED_PNL_REQ, {
             "ctidTraderAccountId": acct_num
@@ -767,8 +864,8 @@ class CTraderClient:
 
     async def request_snapshot(self, account_id: Any, from_timestamp_ms: int, to_timestamp_ms: int) -> Dict[str, Any]:
         acct_num = self._clean_numeric_account_id(account_id)
-        if not acct_num:
-            return {"reconciled": False, "deals": False}
+        if not acct_num or not self.is_account_authenticated(acct_num):
+            return {"reconciled": False, "deals": False, "positions": [], "closedDeals": [], "errors": ["account_not_authenticated"]}
         loop = asyncio.get_event_loop()
         reconcile_future = loop.create_future()
         deal_future = loop.create_future()
@@ -930,7 +1027,11 @@ class CTraderClient:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"[cTrader.Read] Read error ({e}). Closing transport...")
+                err_str = str(e)
+                if "1000 (OK)" in err_str or "ConnectionClosedOK" in err_str or "ConnectionClosed" in type(e).__name__:
+                    logger.info(f"[cTrader.Read] Transport closed cleanly ({e}).")
+                else:
+                    logger.warning(f"[cTrader.Read] Read error ({e}). Closing transport...")
                 break
 
     async def _handle_incoming_message(self, payload_type: int, payload_data: Dict[str, Any]):
@@ -1019,7 +1120,27 @@ class CTraderClient:
             error_code = payload_data.get("errorCode", "UNKNOWN")
             desc = payload_data.get("description", "cTrader Open API Error")
             acct_num = self._as_int(payload_data.get("ctidTraderAccountId"))
+
+            if error_code == "ALREADY_SUBSCRIBED":
+                logger.info(f"[cTrader.Spot] Spot subscription already active: {desc} (Account: {acct_num})")
+                return
+
+            if error_code == "ALREADY_LOGGED_IN" and acct_num in self.account_states:
+                self._handle_account_auth_success(acct_num)
+                future = self._account_auth_futures.get(acct_num)
+                if future and not future.done():
+                    future.set_result(True)
+                return
+
             logger.error(f"[cTrader.Error] ProtoOAErrorRes (2142) [{error_code}]: {desc} (Account: {acct_num})")
+            if acct_num and acct_num in self.account_states:
+                if any(k in str(desc).upper() or k in str(error_code).upper() for k in ["NOT AUTHORIZED", "AUTH", "INVALID", "CANT_ROUTE_REQUEST", "ROUTE"]):
+                    self.account_states[acct_num]["authStatus"] = AccountAuthStatus.FAILED.value
+                    self.account_states[acct_num]["lastError"] = f"[{error_code}] {desc}"
+            if acct_num in self._account_auth_futures:
+                fut = self._account_auth_futures[acct_num]
+                if not fut.done():
+                    fut.set_exception(RuntimeError(f"cTrader Error ({error_code}): {desc}"))
             if error_code == "ALREADY_LOGGED_IN" and acct_num in self.account_states:
                 self._handle_account_auth_success(acct_num)
                 future = self._account_auth_futures.get(acct_num)

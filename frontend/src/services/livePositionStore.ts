@@ -2,6 +2,35 @@ import { LivePositionUpdate, CTraderPositionUpdatePayload } from './socketClient
 
 export type PositionUpdateListener = (update: LivePositionUpdate) => void;
 
+export function normalizePositionUpdate(update: LivePositionUpdate | CTraderPositionUpdatePayload): LivePositionUpdate {
+  const postId = (update as any).postId || (update as any).tradeId || (update as any).positionId;
+  const tradeId = (update as any).tradeId || (update as any).positionId || (update as any).postId;
+  const positionId = (update as any).positionId || (update as any).tradeId;
+
+  const entryPrice = Number((update as any).entryPrice ?? (update as any).entry);
+  const currentPrice = Number((update as any).currentPrice ?? (update as any).current ?? (update as any).bid);
+  const symbol = String(update.symbol || 'XAUUSD');
+  const direction = String((update as any).direction ?? (update as any).side ?? 'BUY').toUpperCase() as 'BUY' | 'SELL';
+
+  return {
+    postId: String(postId || ''),
+    tradeId: String(tradeId || ''),
+    positionId: String(positionId || ''),
+    symbol,
+    entryPrice: Number.isFinite(entryPrice) && entryPrice > 0 ? entryPrice : undefined,
+    entry: Number.isFinite(entryPrice) && entryPrice > 0 ? entryPrice : undefined,
+    currentPrice: Number.isFinite(currentPrice) && currentPrice > 0 ? currentPrice : undefined,
+    current: Number.isFinite(currentPrice) && currentPrice > 0 ? currentPrice : undefined,
+    progress: update.progress ?? 50,
+    profit: (update as any).profitUsd ?? (update as any).profit ?? 0,
+    profitPercent: (update as any).profitPercent ?? 0,
+    pips: Number(update.pips ?? 0),
+    volumeLot: (update as any).volumeLot,
+    status: (update.status as any) || 'OPEN',
+    direction,
+  };
+}
+
 class LivePositionStore {
   private latestUpdates: Map<string, LivePositionUpdate> = new Map();
   private keyListeners: Map<string, Set<PositionUpdateListener>> = new Map();
@@ -10,23 +39,10 @@ class LivePositionStore {
    * Dispatches a new position tick update to listeners registered for this specific key
    */
   public dispatchUpdate(update: LivePositionUpdate | CTraderPositionUpdatePayload): void {
-    const postId = (update as any).postId || (update as any).tradeId || (update as any).positionId;
-    const tradeId = (update as any).tradeId || (update as any).positionId || (update as any).postId;
-    const positionId = (update as any).positionId || (update as any).tradeId;
-
-    const normalized: LivePositionUpdate = {
-      postId: String(postId || ''),
-      tradeId: String(tradeId || ''),
-      positionId: String(positionId || ''),
-      symbol: update.symbol || 'XAUUSD',
-      currentPrice: (update as any).currentPrice ?? (update as any).current ?? (update as any).bid ?? 0,
-      progress: update.progress ?? 50,
-      profit: (update as any).profitUsd ?? (update as any).profit ?? 0,
-      profitPercent: update.profitPercent ?? 0,
-      pips: update.pips ?? 0,
-      volumeLot: (update as any).volumeLot,
-      status: (update.status as any) || 'OPEN'
-    };
+    const normalized = normalizePositionUpdate(update);
+    const postId = normalized.postId;
+    const tradeId = normalized.tradeId;
+    const positionId = normalized.positionId;
 
     // Store latest snapshot in memory for fast catch-up when scrolling into viewport
     if (postId) this.latestUpdates.set(String(postId), normalized);

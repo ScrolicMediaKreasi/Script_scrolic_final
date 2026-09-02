@@ -1099,25 +1099,30 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
                 Tidak ada pengguna yang cocok dengan filter pencarian.
               </div>
             ) : (
-              usersList.map((u) => (
-                <div
-                  key={u.id}
-                  className={`p-3.5 rounded-2xl border transition-all ${
-                    u.isBanned
-                      ? 'bg-rose-950/20 border-rose-500/30'
-                      : u.role === 'admin'
-                      ? 'bg-emerald-950/20 border-emerald-500/30'
-                      : 'bg-[#111111] border-[#1f1f1f]'
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="flex items-center gap-2.5">
-                      <img
-                        src={u.avatar}
-                        alt={u.username}
-                        referrerPolicy="no-referrer"
-                        className="w-10 h-10 rounded-full object-cover border border-white/10"
-                      />
+              usersList.map((u) => {
+                const safeAvatarUrl = u.avatar && u.avatar.trim() !== '' 
+                  ? u.avatar 
+                  : 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80';
+
+                return (
+                  <div
+                    key={u.id}
+                    className={`p-3.5 rounded-2xl border transition-all ${
+                      u.isBanned
+                        ? 'bg-rose-950/20 border-rose-500/30'
+                        : u.role === 'admin'
+                        ? 'bg-emerald-950/20 border-emerald-500/30'
+                        : 'bg-[#111111] border-[#1f1f1f]'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-2.5">
+                        <img
+                          src={safeAvatarUrl}
+                          alt={u.username}
+                          referrerPolicy="no-referrer"
+                          className="w-10 h-10 rounded-full object-cover border border-white/10"
+                        />
                       <div>
                         <div className="flex items-center gap-1.5">
                           <h4 className="font-bold text-white text-xs">{u.displayName}</h4>
@@ -1226,7 +1231,8 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
 
                   </div>
                 </div>
-              ))
+              );
+            })
             )}
           </div>
         </div>

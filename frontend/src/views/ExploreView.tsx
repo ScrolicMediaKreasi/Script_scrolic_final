@@ -59,7 +59,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
       <div className="pt-2 pb-3 mb-2 space-y-3">
         <div>
           <h2 className="text-xl font-black text-white font-display">Explore & Leaderboard</h2>
-          <p className="text-xs text-neutral-400">Temukan Master Trader & Setup DNA Terverifikasi</p>
+          <p className="text-xs text-neutral-400">Temukan Master Trader & Setup Strategi Terverifikasi</p>
         </div>
 
         {/* Search Input */}
@@ -189,41 +189,51 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
         </div>
 
         <div className="space-y-2">
-          {trendingPosts.map((post) => (
-            <div
-              key={post.id}
-              onClick={() => onOpenDetail(post)}
-              className="bg-[#111111] border border-[#1f1f1f] rounded-2xl p-3 flex items-center justify-between hover:border-neutral-700 transition-all cursor-pointer"
-            >
-              <div className="flex items-center gap-3">
-                <img 
-                  src={post.user.avatar} 
-                  alt={post.user.username} 
-                  className="w-9 h-9 rounded-full object-cover"
-                />
-                <div>
-                  <div className="flex items-center gap-1.5">
-                    <span className="font-bold text-white text-xs">{post.trade?.symbol && post.trade.symbol !== 'Unknown' ? post.trade.symbol : 'XAUUSD'}</span>
-                    <span className={`text-[9px] font-black px-1.5 py-0.2 rounded uppercase ${
-                      post.trade.direction === 'BUY' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-rose-500/20 text-rose-300'
-                    }`}>
-                      {post.trade.direction}
-                    </span>
+          {trendingPosts.map((post) => {
+            const sym = post.trade?.symbol && post.trade.symbol !== 'Unknown' ? post.trade.symbol : 'XAUUSD';
+            const dir = post.trade?.direction || 'BUY';
+            const isBuy = dir === 'BUY';
+            const profitUSD = post.trade?.profitUSD ?? 0;
+            const isProfit = profitUSD >= 0;
+            const username = post.user?.username || 'trader';
+            const avatar = post.user?.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80';
+
+            return (
+              <div
+                key={post.id}
+                onClick={() => onOpenDetail && onOpenDetail(post)}
+                className="bg-[#111111] border border-[#1f1f1f] rounded-2xl p-3 flex items-center justify-between hover:border-neutral-700 transition-all cursor-pointer"
+              >
+                <div className="flex items-center gap-3">
+                  <img 
+                    src={avatar} 
+                    alt={username} 
+                    className="w-9 h-9 rounded-full object-cover"
+                  />
+                  <div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-bold text-white text-xs">{sym}</span>
+                      <span className={`text-[9px] font-black px-1.5 py-0.2 rounded uppercase ${
+                        isBuy ? 'bg-emerald-500/20 text-emerald-300' : 'bg-rose-500/20 text-rose-300'
+                      }`}>
+                        {dir}
+                      </span>
+                    </div>
+                    <span className="text-[10px] text-neutral-400">oleh @{username}</span>
                   </div>
-                  <span className="text-[10px] text-neutral-400">oleh @{post.user.username}</span>
+                </div>
+
+                <div className="text-right font-mono">
+                  <span className={`text-xs font-bold ${isProfit ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {isProfit ? '+' : ''}${profitUSD.toFixed(2)}
+                  </span>
+                  <span className="text-[10px] text-neutral-400 block">
+                    {post.likesCount || 0} suka • {post.commentsCount || 0} komentar
+                  </span>
                 </div>
               </div>
-
-              <div className="text-right font-mono">
-                <span className={`text-xs font-bold ${(post.trade.profitUSD ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {(post.trade.profitUSD ?? 0) >= 0 ? '+' : ''}${(post.trade.profitUSD ?? 0).toFixed(2)}
-                </span>
-                <span className="text-[10px] text-neutral-400 block">
-                  {post.likesCount} suka • {post.commentsCount} komentar
-                </span>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </div>

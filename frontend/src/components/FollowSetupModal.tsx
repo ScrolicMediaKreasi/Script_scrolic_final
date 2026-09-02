@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { X, ShieldAlert, CheckCircle2, Zap, ArrowRight, Sparkles, AlertCircle, Users, Link2 } from 'lucide-react';
 import { FeedPost, User } from '../types';
 import { triggerHaptic } from '../utils/haptics';
+import { safeAvatarUrl, handleAvatarError } from '../utils/avatar';
 import { 
   getSymbolSpecs, 
   formatCTraderPrice, 
@@ -236,9 +237,10 @@ export const FollowSetupModal: React.FC<FollowSetupModalProps> = ({
               <div className="bg-[#111111] p-3.5 rounded-xl border border-[#1f1f1f] flex items-center justify-between">
                 <div className="flex items-center gap-2.5">
                   <img 
-                    src={user.avatar} 
-                    alt={user.username} 
-                    className="w-8 h-8 rounded-full object-cover border border-[#2a2a2a]" 
+                    src={safeAvatarUrl(user.avatar, user.username)}
+                    alt={user.username}
+                    onError={(event) => handleAvatarError(event, user.username, user.avatar)}
+                    className="w-8 h-8 rounded-full object-cover border border-[#2a2a2a]"
                   />
                   <div>
                     <span className="text-neutral-200 font-bold block">@{user.username}</span>

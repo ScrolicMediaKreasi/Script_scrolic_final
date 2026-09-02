@@ -72,15 +72,18 @@ export const FeedView: React.FC<FeedViewProps> = ({
   const [highlightedPostId, setHighlightedPostId] = useState<string | null>(null);
 
   // Filter posts
-  const filteredPosts = posts.filter((p) => {
+  const filteredPosts = (posts || []).filter((p) => {
+    if (!p) return false;
     // Tab filter
     if (feedType === 'following') {
       if (!currentUser) return false;
-      const isFollowed = (currentUser.followingList || []).includes(p.user.username);
+      const username = p.user?.username || (p as any).username;
+      const isFollowed = Boolean(username && (currentUser.followingList || []).includes(username));
       if (!isFollowed && p.userId !== currentUser.id) return false;
     }
     // Strategy filter
-    if (selectedStrategyFilter !== 'ALL' && p.strategy.id !== selectedStrategyFilter) {
+    const stratId = p.strategy?.id || (p as any).strategyId || (p.trade as any)?.strategyId || (p as any).strategy_id;
+    if (selectedStrategyFilter !== 'ALL' && stratId && stratId !== selectedStrategyFilter) {
       return false;
     }
     return true;
@@ -269,7 +272,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
               </div>
             </div>
 
-            {/* Strategy DNA Horizontal Filter Pills */}
+            {/* Strategy Filter Pills */}
             <div className="flex gap-1.5 overflow-x-auto no-scrollbar px-2 pt-0.5">
               <button
                 onClick={() => {
@@ -283,7 +286,7 @@ export const FeedView: React.FC<FeedViewProps> = ({
                     : 'bg-[#141414] border border-[#222222] text-neutral-400 hover:text-neutral-200'
                 }`}
               >
-                Semua DNA
+                Semua Strategi
               </button>
               {STRATEGY_LIST.map((strat) => (
                 <button

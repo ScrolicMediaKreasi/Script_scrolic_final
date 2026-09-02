@@ -160,10 +160,12 @@ export const PWAInstallBanner: React.FC<PWAInstallBannerProps> = ({
         <div className="flex items-center justify-between gap-3">
           {/* Small Scrolic Brand Logo */}
           <div className="flex items-center gap-2.5 flex-1 min-w-0">
-            <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-emerald-600 via-emerald-400 to-amber-400 p-[2px] shrink-0 shadow-md shadow-emerald-500/20">
-              <div className="w-full h-full bg-[#07110A] rounded-[9px] flex items-center justify-center font-black text-emerald-400 text-xs">
-                S
-              </div>
+            <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-emerald-600 via-emerald-400 to-amber-400 p-[2px] shrink-0 shadow-md shadow-emerald-500/20 ring-1 ring-white/10">
+              <img
+                src="/scrolic-icon.png"
+                alt="Scrolic icon"
+                className="w-full h-full object-cover rounded-[14px] bg-[#07110A]"
+              />
             </div>
 
             <div className="min-w-0 flex-1">

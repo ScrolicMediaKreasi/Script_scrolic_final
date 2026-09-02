@@ -50,13 +50,16 @@ def format_auth_user_response(user: Dict[str, Any]) -> Dict[str, Any]:
             "createdAt": b_created_str
         })
 
+    default_avatar_seed = str(user.get("username") or user.get("display_name") or user.get("displayName") or "trader")
+    default_avatar = f"https://api.dicebear.com/7.x/bottts/svg?seed={urllib.parse.quote(default_avatar_seed, safe='')}"
+
     return {
         "id": str(user.get("id") or user.get("_id") or "user-unknown"),
         "username": user.get("username", "trader"),
         "displayName": user.get("display_name") or user.get("displayName") or user.get("username", "Trader"),
         "email": user.get("email"),
         "emailVerified": bool(user.get("email_verified", user.get("emailVerified", False))),
-        "avatar": user.get("avatar") or f"https://api.dicebear.com/7.x/bottts/svg?seed={user.get('username', 'trader')}",
+        "avatar": user.get("avatar") or default_avatar,
         "bio": user.get("bio", ""),
         "role": str(user.get("role", "user")).lower(),
         "isBanned": bool(user.get("is_banned", False)),
@@ -73,6 +76,7 @@ def format_auth_user_response(user: Dict[str, Any]) -> Dict[str, Any]:
         "followingCount": int(user.get("following_count", user.get("followingCount", 0))),
         "followingList": user.get("following_list", user.get("followingList", [])),
         "energyBalance": int(user.get("energy", user.get("energyBalance", 0))),
+        "withdrawableEnergy": int(user.get("withdrawable_energy", user.get("withdrawableEnergy", 0))),
         "referralCode": user.get("referral_code", user.get("referralCode", "")),
         "referralsCount": int(user.get("referrals_count", user.get("referralsCount", 0))),
         "affiliateEarningsEnergy": int(user.get("affiliate_earnings_energy", user.get("affiliateEarningsEnergy", 0))),
@@ -217,10 +221,11 @@ class AuthService:
                 if referrer:
                     referrer_id = referrer.get("id") or referrer.get("username")
                     # Reward referrer with 20 Energy
-                    db_store.update_energy(referrer_id, 20)
+                    db_store.update_energy(referrer_id, 20, bucket="withdrawable")
                     db_store.update_user(referrer_id, {
                         "referrals_count": referrer.get("referrals_count", 0) + 1,
-                        "affiliate_earnings_energy": referrer.get("affiliate_earnings_energy", 0) + 20
+                        "affiliate_earnings_energy": referrer.get("affiliate_earnings_energy", 0) + 20,
+                        "withdrawable_energy": int(referrer.get("withdrawable_energy", 0)) + 20
                     })
                     db_store.create_transaction({
                         "user_id": referrer_id,
@@ -243,7 +248,7 @@ class AuthService:
                 "username": clean_username,
                 "display_name": display_name,
                 "email": clean_email,
-                "avatar": avatar or f"https://api.dicebear.com/7.x/bottts/svg?seed={clean_username}",
+                "avatar": avatar or f"https://api.dicebear.com/7.x/bottts/svg?seed={urllib.parse.quote(clean_username, safe='')}",
                 "bio": "trader baru scrolic",
                 "role": "user",
                 "premium": False,
@@ -310,7 +315,7 @@ class AuthService:
         await self._check_new_device(user, device_key)
         return user
 
-    async def handle_password_auth(self, email: str, password: str, terms_accepted: bool, privacy_accepted: bool, legal_version: str, device_key: str = "") -> Dict[str, Any]:
+    async def handle_password_auth(self, email: str, password: str, terms_accepted: bool, privacy_accepted: bool, legal_version: str, device_key: str = "", referral_code: Optional[str] = None) -> Dict[str, Any]:
         clean_email = (email or '').lower().strip()
         if not clean_email or not re.match(r'^[^\s@]+@[^\s@]+\.[^\s@]+$', clean_email):
             raise ValueError('Email tidak valid')
@@ -331,6 +336,36 @@ class AuthService:
         username = username or 'trader'
         if db_store.find_user_by_username(username):
             username = f'{username}_{hashlib.sha256(clean_email.encode("utf-8")).hexdigest()[:8]}'
+
+        referrer_id = None
+        code_value = (referral_code or '').strip()
+        if code_value:
+            referrer = db_store.find_user_by_referral_code(code_value) or db_store.find_user_by_id_or_username(code_value)
+            if referrer:
+                referrer_id = referrer.get('id') or referrer.get('username')
+                ref_energy_before = referrer.get('energy', 0)
+                new_ref_energy, _ = db_store.update_energy(referrer_id, 20, bucket='withdrawable')
+                db_store.update_user(referrer_id, {
+                    'referrals_count': referrer.get('referrals_count', 0) + 1,
+                    'affiliate_earnings_energy': referrer.get('affiliate_earnings_energy', 0) + 20,
+                    'withdrawable_energy': int(referrer.get('withdrawable_energy', 0)) + 20,
+                    'referred_by': referrer_id,
+                })
+                db_store.create_transaction({
+                    'user_id': referrer_id,
+                    'type': 'AFFILIATE_COMMISSION',
+                    'amount': 20,
+                    'balance_before': ref_energy_before,
+                    'balance_after': new_ref_energy,
+                    'metadata': {'newUserId': f'user-{username}', 'referralCode': code_value}
+                })
+                db_store.create_notification({
+                    'user_id': referrer_id,
+                    'title': 'Referral Baru Bergabung!',
+                    'message': f'@{username} mendaftar lewat link referral Anda. Anda mendapatkan +20 ENERGY!',
+                    'type': 'AFFILIATE_COMMISSION'
+                })
+
         user = db_store.create_user({
             'id': f'user-{username}',
             'username': username,
@@ -343,6 +378,9 @@ class AuthService:
             'subscription_tier': 'free',
             'strategy_dna': 'breakout',
             'primary_strategy_id': 'breakout',
+            'referral_code': f'{username.upper()}50',
+            'referrer_id': referrer_id,
+            'referred_by': referrer_id,
             'legal_consents': {
                 'termsAccepted': True,
                 'privacyAccepted': True,
@@ -429,14 +467,47 @@ class AuthService:
             return existing
 
         strategy_id = body.get("strategyId", "breakout")
+        referral_code = body.get("referralCode") or body.get("ref") or body.get("referrerId") or body.get("referral_code")
+
+        referrer_id = None
+        if referral_code:
+            referrer = db_store.find_user_by_referral_code(str(referral_code)) or db_store.find_user_by_id_or_username(str(referral_code))
+            if referrer:
+                referrer_id = referrer.get("id") or referrer.get("username")
+                ref_energy_before = referrer.get("energy", 0)
+                new_ref_energy, _ = db_store.update_energy(referrer_id, 20, bucket="withdrawable")
+                db_store.update_user(referrer_id, {
+                    "referrals_count": referrer.get("referrals_count", 0) + 1,
+                    "affiliate_earnings_energy": referrer.get("affiliate_earnings_energy", 0) + 20,
+                    "withdrawable_energy": int(referrer.get("withdrawable_energy", 0)) + 20
+                })
+                db_store.create_transaction({
+                    "user_id": referrer_id,
+                    "type": "AFFILIATE_COMMISSION",
+                    "amount": 20,
+                    "balance_before": ref_energy_before,
+                    "balance_after": new_ref_energy,
+                    "metadata": {"newUserId": f"user-{clean}", "referralCode": str(referral_code)}
+                })
+                db_store.create_notification({
+                    "user_id": referrer_id,
+                    "title": "Referral Baru Bergabung!",
+                    "message": f"@{clean} mendaftar lewat link referral Anda. Anda mendapatkan +20 ENERGY!",
+                    "type": "AFFILIATE_COMMISSION"
+                })
+
         new_user = {
             "id": f"user-{clean}",
             "username": clean,
             "display_name": body.get("displayName") or clean,
+            "email": body.get("email"),
             "strategy_dna": strategy_id,
             "primary_strategy_id": strategy_id,
             "energy": 0,
-            "referral_code": f"{clean.upper()}50"
+            "referral_code": f"{clean.upper()}50",
+            "referrer_id": referrer_id,
+            "referrals_count": 0,
+            "affiliate_earnings_energy": 0
         }
         return db_store.create_user(new_user)
 

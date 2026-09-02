@@ -33,13 +33,16 @@ export interface User {
   username: string;
   displayName: string;
   avatar: string;
-  bio: string;
+  bio?: string;
+  name?: string;
+  email?: string;
   role?: 'user' | 'admin';
   isBanned?: boolean;
   primaryStrategyId?: string;
   strategyDNA?: string;
-  subscriptionTier: SubscriptionTier;
-  isVerified: boolean;
+  subscriptionTier?: SubscriptionTier;
+  isVerified?: boolean;
+  pwaBonusClaimed?: boolean;
   kycStatus?: KycStatus;
   kycFullName?: string;
   kycNik?: string;
@@ -47,7 +50,7 @@ export interface User {
   kycAddress?: string;
   kycVerifiedAt?: string;
   bankAccounts?: BankAccount[];
-  cTraderConnected: boolean;
+  cTraderConnected?: boolean;
   cTraderAccountId?: string;
   cTraderAccounts?: Array<{
     accountId: string;
@@ -61,16 +64,17 @@ export interface User {
   }>;
   cTraderBroker?: string;
   brokerName?: string;
-  followersCount: number;
-  followingCount: number;
+  followersCount?: number;
+  followingCount?: number;
   followingList?: string[];
   totalTrades?: number;
   totalTradesCount?: number;
-  winRate: number;
-  totalProfitUSD: number;
-  totalPips: number;
-  energyBalance: number;
-  referralCode: string;
+  winRate?: number;
+  totalProfitUSD?: number;
+  totalPips?: number;
+  energyBalance?: number;
+  energy?: number;
+  referralCode?: string;
   referralsCount?: number;
   referredBy?: string;
   affiliateEarningsEnergy?: number;
@@ -79,7 +83,7 @@ export interface User {
   defaultFollowFee?: number;
   defaultUnlockPrice?: number;
   defaultFollowPrice?: number;
-  createdAt: string;
+  createdAt?: string;
 }
 
 export interface EnergyPackageConfig {
@@ -119,6 +123,7 @@ export interface Strategy {
   name: string;
   tagline: string;
   description: string;
+  defaultNote?: string;
   accentColor: string; // e.g. #10B981, #F59E0B
   accentBg: string;
   accentBorder: string;
@@ -137,6 +142,7 @@ export type TradeStatus = 'OPEN' | 'CLOSED';
 export interface Trade {
   id: string;
   cTraderPositionId: string;
+  accountId?: string;
   userId: string;
   symbol: string;
   direction: TradeDirection;
@@ -149,6 +155,7 @@ export interface Trade {
   profitUSD: number;
   profitPercent: number;
   pips: number;
+  progress?: number;
   openTime: string;
   closeTime?: string;
   duration: string;
@@ -165,6 +172,27 @@ export interface FeedPost {
   trade: Trade;
   strategy: Strategy;
   autoDescription: string;
+  username?: string;
+  displayName?: string;
+  avatar?: string;
+  trade_id?: string;
+  account_id?: string;
+  user_id?: string;
+  symbol?: string;
+  position_type?: TradeDirection;
+  lot?: number;
+  entry_price?: number;
+  current_price?: number;
+  stop_loss?: number;
+  take_profit?: number;
+  profit?: number;
+  profit_percent?: number;
+  pips?: number;
+  opened_at?: string;
+  strategy_id?: string;
+  status?: TradeStatus;
+  duration?: string;
+  postId?: string;
   customDescription?: string;
   descriptionUpdatedAt?: string;
   likesCount: number;
@@ -240,14 +268,19 @@ export interface Comment {
   createdAt: string;
 }
 
-export type NotificationType = 
-  | 'FOLLOW' 
-  | 'TRADE_OPEN' 
-  | 'TRADE_CLOSE' 
-  | 'LIKE' 
-  | 'COMMENT' 
-  | 'ENERGY' 
-  | 'SYSTEM';
+export type NotificationType =
+  | 'FOLLOW'
+  | 'TRADE_OPEN'
+  | 'TRADE_CLOSE'
+  | 'LIKE'
+  | 'COMMENT'
+  | 'ENERGY'
+  | 'SYSTEM'
+  | 'WITHDRAWAL'
+  | 'KYC_VERIFIED'
+  | 'AFFILIATE_COMMISSION'
+  | 'ENERGY_TOPUP'
+  | 'PREMIUM_UPGRADE';
 
 export type NotificationCategory = 'all' | 'trading' | 'social' | 'system';
 
@@ -281,7 +314,7 @@ export interface FollowOrderSafetyParams {
   estimatedRiskUSD: number;
 }
 
-export type MayarPaymentStatus = 'UNPAID' | 'PAID' | 'EXPIRED' | 'CANCELLED';
+export type MayarPaymentStatus = 'UNPAID' | 'PAID' | 'EXPIRED' | 'CANCELLED' | 'PENDING';
 
 export interface MayarPaymentOrder {
   id: string;
@@ -291,6 +324,7 @@ export interface MayarPaymentOrder {
   amountEnergy: number;
   amountRp: number;
   paymentUrl: string;
+  checkoutUrl?: string;
   qrCode?: string;
   status: MayarPaymentStatus;
   paymentMethod?: string;

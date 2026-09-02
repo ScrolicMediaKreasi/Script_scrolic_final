@@ -1,0 +1,54 @@
+{
+  "summary": "Verified the two reported fixes for @ptsmiea: (1) closed-trade numbers (performance aggregates + feed pips/profit) and (2) the new Position Progress Bar rendering. Backend: 12/14 pytest checks pass — performance aggregates match the broker exactly (191 trades, 94W/97L, 49.2%, realizedPnL -1117.30, largestWin 496.68, largestLoss -789.46, maxDrawdown 1844.34, dataAvailability.hasRealData=true/closedTrades=191); /api/feed returns all 191 CLOSED @ptsmiea posts with pips correctly derived from price diff (pipPosition regression gone: sum pips -3818.1, sum profit -1117.30, no 1000x inflation) and non-zero profits (closePositionDetail fix works). Frontend: feed loads on preview URL, all 32 rendered cards (after infinite scroll) show data-testid position-progress-bar with SL/Entry/Now/TP labels, glowing NOW dot (green rgb(34,197,94) in profit / red rgb(244,63,94) in loss with matching box-shadow glow) and a floating '% Position' badge whose value is dynamic (not 68%) and whose left% is unique per card. Remaining issues: badge rounds tiny moves to '+0.0%' on 11/32 cards, NOW label visually collides with ENTRY label, broker session is NOT actually connected in DB (cTraderConnected=false, no accounts/token) so 0 open positions => real-time WebSocket price/profit movement could not be verified, and the Dashboard Portfolio/summary tab only shows the 8 posts loaded by App (/api/feed?limit=8) instead of the 191 closed trades, so pagination testids never render and Win/Loss shows 3/5 and Total P/L $0.00.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/user/me", "issue": "Returns cTraderConnected=false, cTraderAccountId=null, cTraderAccounts=[] for user-ptsmiea (DB record has ctrader_access_token=null). Contradicts test_credentials.md (accounts 48005582/48144800 connected). Consequence: Dashboard broker panel shows DISCONNECTED/'Belum Terhubung', openPositions=0, and live WebSocket tick updates cannot be exercised."},
+      {"endpoint": "GET /api/feed", "issue": "profitUSD is inconsistent with the reported volumeLot for XAUUSD: for nearly every 0.01-lot post |profit| is exactly 2x (move x 100 x lot), e.g. move -4.42 -> profit -8.96; and one 0.1-lot post shows move -2.27 with profit -233.00 (10x). Broker gross profit is likely correct, so normalize_volume_lots/_lot_scale_from_symbol_meta for gold is under-reporting lot size (0.02 shown as 0.01, 1.0 shown as 0.1). UI shows the wrong 'Volume x Lot'."},
+      {"endpoint": "GET /api/feed", "issue": "All 191 posts have stop_loss=0 / take_profit=0 (SL/TP not synced from broker), so every progress bar renders 'SL -' / 'TP -' and uses default anchor percentages instead of real risk range."},
+      {"endpoint": "GET /api/feed", "issue": "profitPercent for the 19-Aug batch reaches -19.13%/+11.63% (outside the expected -1%..+1% band) because the percent divisor uses entry x lotUnits x lot, which is also affected by the lot-scaling issue above."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "PositionProgressBar badge", "issue": "positionPercent is rounded to 1 decimal before display (line 174-176 returns 2-dec value but render uses toFixed(1)), so 11/32 cards display '+0.0% Position' / '-0.0% Position' for small closed moves instead of the real value (e.g. +0.04%).", "selector": "[data-testid=\"progress-position-badge\"]", "priority": "MEDIUM"},
+      {"component": "PositionProgressBar labels", "issue": "When |nowPercent - entryPercent| < 8 the NOW label is only pushed down 22px and still visually collides with the ENTRY price text (measured boxes: ENTRY x=107 w=56, NOW x=96 w=56).", "selector": "[data-testid=\"position-progress-bar\"]", "priority": "MEDIUM"},
+      {"component": "PositionProgressBar risk zone", "issue": "Red SL->Entry risk zone and the red SL tick are still drawn when no SL exists (SL displays '-'), implying a stop that does not exist.", "selector": "[data-testid=\"position-progress-bar\"]", "priority": "LOW"},
+      {"component": "DashboardView summary hero", "issue": "Label reads 'Total Profit / Loss Bersih' but the value rendered is activeAccountEquity ($0.00) and it is hard-coded emerald-400 (green) even for a loss; the computed netProfitUSD/totalPips are never displayed. With broker disconnected the card shows $0.00 while realized PnL is -$1117.30.", "selector": "div:has-text(\"TOTAL PROFIT / LOSS BERSIH\")", "priority": "HIGH"}
+    ],
+    "integration_issues": [
+      {"flow": "Dashboard > Portofolio history", "issue": "Portfolio tab shows only 8 closed trades ('Portofolio (8)', 'Riwayat (8) Trade Terakhir') because App.tsx fetches only /api/feed?limit=8 and DashboardView derives accountClosedTrades from those posts. Consequently totalPages=1, so portfolio-prev-page / portfolio-next-page / portfolio-page-indicator never render, and Win/Loss shows 3/5 instead of 94/97. Dashboard history therefore does NOT match the real cTrader account (191 trades).", "affected_selectors": ["[data-testid=\"portfolio-page-indicator\"]", "[data-testid=\"portfolio-next-page\"]", "[data-testid=\"portfolio-prev-page\"]", "[data-testid=\"portfolio-summary\"]"]},
+      {"flow": "Real-time WebSocket price/profit updates", "issue": "NOT VERIFIABLE: socket.io connects (wss .../socket.io) and rooms join for user-ptsmiea, but there are 0 OPEN positions and the cTrader client log loops CONNECTING/DISCONNECTED with no persisted access token, so no tick updates arrive and moving price/profit could not be observed.", "affected_selectors": ["[data-testid=\"progress-now-dot\"]"]},
+      {"flow": "Guest first-load", "issue": "First navigation logs repeated 'TypeError: Failed to fetch' warnings for /api/user/me, /api/users, /api/feed?limit=8, /api/notifications before a retry succeeds; feed eventually renders, but the initial failures are user-visible latency/flicker.", "affected_selectors": []}
+    ],
+    "design_issues": [
+      {"screen": "Feed card progress bar", "issues": ["NOW price label crowds/overlaps ENTRY label when the price barely moved", "Badge text color #04120a on green/red gradient is fine, but on the red badge contrast is borderline (dark navy on rose)", "SL/TP columns show '-' on 100% of cards, making the SL->Entry->Now->TP reference layout look half-empty"]},
+      {"screen": "Dashboard summary", "issues": ["Broker panel shows DISCONNECTED / $0 USD / 'ID: Belum Terhubung' while stats above claim 191 trades & 49.2% win rate — contradictory state presented to the user"]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_ptsmiea_ctrader.py", "/app/test_reports/pytest/ptsmiea_results.xml"],
+  "action_items": [
+    "Load the full closed-trade history for the Dashboard (dedicated endpoint or /api/feed with a larger limit / performance recentActivity) so Portofolio shows 191 trades and the 20-per-page pagination controls actually render",
+    "Fix the summary hero card: display netProfitUSD (with sign-based color) instead of equity under the 'Total Profit / Loss Bersih' label, and derive Win/Loss from performance API (94/97) rather than the 8 loaded posts",
+    "Fix volumeLot normalization for XAUUSD (broker profit is 2x/10x the value implied by the displayed lot) so Volume, pips and profit are mutually consistent",
+    "Restore/persist the cTrader access token + accounts for user-ptsmiea (currently ctrader_access_token=null, ctrader_connected=false) so open positions and real-time WS tick updates can work and be retested",
+    "Sync stopLoss/takeProfit from the broker (all 191 posts have 0) so the progress bar can use the real SL/TP range; until then hide the red risk zone/SL tick when SL is absent",
+    "Show 2 decimals in the position badge for sub-0.1% moves instead of '+0.0% Position'",
+    "Increase the NOW label vertical offset (or shift horizontally) to avoid overlapping the ENTRY label"
+  ],
+  "critical_code_review_comments": [
+    "DashboardView.tsx L290-314: closed trades come exclusively from props/posts supplied by App.tsx's /api/feed?limit=8 call — a per-account history fetch is required; the pagination block at L867 is dead code while only 8 items exist.",
+    "DashboardView.tsx L434-435: netProfitUSD/totalPips are computed but never rendered; L527 renders activeAccountEquity under a 'Total Profit / Loss Bersih' heading with a hard-coded green class.",
+    "PositionProgressBar.tsx L380: `positionPercent.toFixed(1)` discards the 2-decimal value returned by the L175 branch, producing '+0.0% Position'.",
+    "PositionProgressBar.tsx L262-321: SL risk zone / SL & TP ticks render unconditionally, ignoring hasSL/hasTP.",
+    "ticker.py _lot_scale_from_symbol_meta (L168-172): gold lot scale appears off by 2x/10x versus broker gross profit — validate against ProtoOASymbol lotSize/moneyDigits rather than hard-coded 10000."
+  ],
+  "updated_files": ["/app/backend/tests/test_ptsmiea_ctrader.py"],
+  "success_rate": {"backend": "86% (12/14 pytest checks)", "frontend": "70% (progress bar OK; dashboard portfolio history + real-time updates failed/unverifiable)"},
+  "seed_data_creation": "None — used existing 191 broker-sourced posts for user-ptsmiea; no data created or modified",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "No login used; simulated session via header x-session-user-id: user-ptsmiea for API and cookie scrolic_uid=user-ptsmiea + localStorage scrolic_user_id for UI",
+  "context_for_next_testing_agent": "Run `pytest /app/backend/tests/test_ptsmiea_ctrader.py -v` — the 2 known failures are (a) profit vs volumeLot scaling and (b) /api/user/me cTraderConnected=false. For UI, set cookie scrolic_uid=user-ptsmiea (and localStorage scrolic_user_id) before load to reach the Dashboard; the guest state shows a login gate. Feed progress bar verified via document.querySelectorAll('[data-testid=\"position-progress-bar\"]') reading badge innerText + dot style.left/background. Real-time WS movement still untested because there are 0 open positions.",
+  "rca_of_the_issue": "Fix #1 (numbers) is confirmed working: pips now equal price-diff/pip-size (pipPosition preserved: gold pip 0.1, BTC 1.0) and profits are non-zero and sum exactly to -1117.30 / -3818.1 pips matching the performance endpoint, so the pipPosition-overwrite and deal.grossProfit bugs are resolved. Fix #2 (progress bar) renders on every card with dynamic nowPercent/positionPercent and correct green/red glow, but two residual problems remain: display rounding hides sub-0.1% moves and the NOW/ENTRY labels overlap. Separately, the Dashboard Portfolio/summary tab still does not match the real account because it consumes only the 8 posts App.tsx pre-fetches, and the cTrader broker session is no longer authenticated in the DB (ctrader_access_token=null), which also blocks verification of live WebSocket price movement."
+}

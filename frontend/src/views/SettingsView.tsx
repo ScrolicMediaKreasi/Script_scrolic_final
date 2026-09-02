@@ -28,6 +28,7 @@ import { User as UserType } from '../types';
 import { STRATEGY_LIST } from '../data/strategies';
 import { CTraderGatewayModal } from '../components/CTraderGatewayModal';
 import { EditAvatarModal } from '../components/EditAvatarModal';
+import { safeAvatarUrl, handleAvatarError } from '../utils/avatar';
 import { triggerHaptic } from '../utils/haptics';
 
 interface SettingsViewProps {
@@ -162,9 +163,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         <div className="flex items-center gap-3">
           <div className="relative group">
             <img 
-              src={currentUser.avatar} 
+              src={safeAvatarUrl(currentUser.avatar, currentUser.username)} 
               alt={currentUser.username} 
               referrerPolicy="no-referrer"
+              onError={(event) => handleAvatarError(event, currentUser.username, currentUser.avatar)}
               className="w-12 h-12 rounded-full object-cover border border-emerald-500/40"
             />
             <button
@@ -397,9 +399,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           />
         </div>
 
-        {/* Strategy DNA Preference */}
+        {/* Strategy Preference */}
         <div>
-          <label className="block text-[11px] font-semibold text-neutral-400 mb-1">Trader DNA Identity</label>
+          <label className="block text-[11px] font-semibold text-neutral-400 mb-1">Preferensi Strategi</label>
           <select
             value={primaryStrategyId}
             onChange={(e) => setPrimaryStrategyId(e.target.value)}

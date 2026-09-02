@@ -14,6 +14,7 @@ import { AdminDashboardView } from './views/AdminDashboardView';
 
 // Modals & Drawers
 import { TradeDetailModal } from './components/TradeDetailModal';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { FollowSetupModal } from './components/FollowSetupModal';
 import { AskAIModal } from './components/AskAIModal';
 import { EnergyModal } from './components/EnergyModal';
@@ -40,9 +41,30 @@ import { livePositionStore } from './services/livePositionStore';
 import { readCookie } from './utils/authFetch';
 import { ShieldCheck, Zap, Lock, LogIn, ArrowRight } from 'lucide-react';
 
+async function safeApiFetch<T = any>(url: string, init: RequestInit = {}): Promise<{ ok: boolean; status: number; data: T | null }> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    if (!response.ok || response.status >= 500) {
+      console.warn(`[API] ${url} failed with status ${response.status}`);
+      return { ok: false, status: response.status, data: null };
+    }
+
+    const data = await response.json().catch(() => null);
+    return { ok: true, status: response.status, data: data as T };
+  } catch (error) {
+    console.warn(`[API] ${url} request error:`, error);
+    return { ok: false, status: 0, data: null };
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
 export default function App() {
   // Navigation State
-  const [currentTab, setCurrentTab] = useState<NavTab | 'notifications'>('feed');
+  const [currentTab, setCurrentTab] = useState<NavTab>('feed');
   const [viewingProfileUsername, setViewingProfileUsername] = useState<string | null>(null);
   const [performanceUsername, setPerformanceUsername] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -57,6 +79,7 @@ export default function App() {
   const [hasMorePosts, setHasMorePosts] = useState<boolean>(false);
   const [isLoadingMore, setIsLoadingMore] = useState<boolean>(false);
   const [isLoadingFeed, setIsLoadingFeed] = useState<boolean>(true);
+  const [isAuthResolved, setIsAuthResolved] = useState(false);
 
   const [users, setUsers] = useState<User[]>([]);
   const [liveTrades, setLiveTrades] = useState<Trade[]>([]);
@@ -83,6 +106,7 @@ export default function App() {
   const [legalPage, setLegalPage] = useState<'terms' | 'privacy' | null>(null);
   const [resetPasswordToken, setResetPasswordToken] = useState<string | null>(null);
   const [publicInfoPage, setPublicInfoPage] = useState<'about' | 'pricing' | 'faq' | null>(null);
+  const [occupiedCTraderNotice, setOccupiedCTraderNotice] = useState<{ occupiedBy: string; accountId: string } | null>(null);
 
   const openAdminDashboard = () => {
     if (String(currentUser?.role || '').toLowerCase() !== 'admin') {
@@ -119,6 +143,23 @@ export default function App() {
       window.history.replaceState({}, document.title, window.location.pathname);
     }
 
+    if (searchParams.get('ctrader_error') === 'account_occupied') {
+      const occupiedBy = searchParams.get('occupied_by') || 'pengguna lain';
+      const accountId = searchParams.get('account_id') || 'cTrader';
+      setOccupiedCTraderNotice({ occupiedBy, accountId });
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+
+    const handleOAuthPostMessage = (e: MessageEvent) => {
+      if (e.data?.type === 'CTRADER_OAUTH_ERROR' && e.data?.error?.code === 'ACCOUNT_ALREADY_CONNECTED') {
+        const occupiedBy = e.data.error.occupiedBy || '@trader';
+        const accountId = e.data.error.accountId || '';
+        setOccupiedCTraderNotice({ occupiedBy, accountId });
+        triggerHaptic('error');
+      }
+    };
+    window.addEventListener('message', handleOAuthPostMessage);
+
     const pathname = window.location.pathname;
     if (pathname === '/terms' || pathname === '/privacy-policy' || pathname === '/privacy') {
       setLegalPage(pathname === '/terms' ? 'terms' : 'privacy');
@@ -135,6 +176,22 @@ export default function App() {
     const performanceMatch = pathname.match(/^\/u\/([^/]+)\/performance\/?$/);
     if (performanceMatch) {
       setPerformanceUsername(decodeURIComponent(performanceMatch[1]));
+      return;
+    }
+    const profileMatch = pathname.match(/^\/u\/([^/]+)\/?$/);
+    if (profileMatch) {
+      setViewingProfileUsername(decodeURIComponent(profileMatch[1]));
+      setCurrentTab('profile');
+      return;
+    }
+    const tabRoutes: Record<string, NavTab> = {
+      '/explore': 'explore',
+      '/dashboard': 'dashboard',
+      '/news': 'news',
+      '/notifications': 'notifications'
+    };
+    if (tabRoutes[pathname]) {
+      setCurrentTab(tabRoutes[pathname]);
       return;
     }
     if (pathname.startsWith('/@')) {
@@ -218,30 +275,27 @@ export default function App() {
         }).catch(() => {});
       }
 
-      // Execute all core endpoint fetches in parallel for ultra-fast startup (<100ms)
-      const [meRes, feedRes, usersRes, notifRes] = await Promise.all([
-        fetch('/api/user/me', { headers }).catch(() => null),
-        fetch('/api/feed?limit=8').catch(() => null),
-        fetch('/api/users').catch(() => null),
-        fetch('/api/notifications', { headers }).catch(() => null)
+      const [meResp, feedResp, usersResp, notifResp] = await Promise.all([
+        safeApiFetch('/api/user/me', { headers }),
+        safeApiFetch('/api/feed?limit=8'),
+        safeApiFetch('/api/users'),
+        safeApiFetch('/api/notifications', { headers })
       ]);
 
-      if (meRes && meRes.ok) {
-        const meData = await meRes.json().catch(() => ({}));
-        if (meData?.user) {
-          setCurrentUser(meData.user);
-          const resolvedUserId = meData.user.id || meData.user.username;
-          localStorage.setItem('scrolic_user_id', resolvedUserId);
-          document.cookie = `scrolic_uid=${encodeURIComponent(resolvedUserId)}; path=/; max-age=31536000; SameSite=Lax`;
-        } else if (savedUserId) {
-          setCurrentUser(null);
-        }
+      if (meResp.ok && meResp.data?.user) {
+        const meData = meResp.data as { user?: User };
+        setCurrentUser(meData.user);
+        const resolvedUserId = meData.user.id || meData.user.username;
+        localStorage.setItem('scrolic_user_id', resolvedUserId);
+        document.cookie = `scrolic_uid=${encodeURIComponent(resolvedUserId)}; path=/; max-age=31536000; SameSite=Lax`;
+      } else if (savedUserId) {
+        setCurrentUser(null);
       }
 
-      if (feedRes && feedRes.ok) {
-        const feedData = await feedRes.json().catch(() => ({}));
-        if (feedData?.posts) {
-          const enrichedPosts = (feedData.posts as FeedPost[]).map((p) => ({
+      if (feedResp.ok && feedResp.data?.posts) {
+        const feedData = feedResp.data as { posts?: FeedPost[]; next_cursor?: string | null; has_more?: boolean };
+        if (feedData.posts) {
+          const enrichedPosts = feedData.posts.map((p) => ({
             ...p,
             strategy: getStrategy(p.strategy?.id || p.trade?.strategyId || (p as any).strategyId)
           }));
@@ -252,19 +306,19 @@ export default function App() {
         }
       }
 
-      if (usersRes && usersRes.ok) {
-        const usersData = await usersRes.json().catch(() => ({}));
-        if (usersData?.users) {
+      if (usersResp.ok && usersResp.data?.users) {
+        const usersData = usersResp.data as { users?: User[] };
+        if (usersData.users) {
           setUsers(usersData.users);
         }
       }
 
-      if (notifRes && notifRes.ok) {
-        const notifData = await notifRes.json().catch(() => ({}));
-        if (notifData?.notifications) {
+      if (notifResp.ok && notifResp.data?.notifications) {
+        const notifData = notifResp.data as { notifications?: Notification[]; snapshot?: { unread_count?: number } };
+        if (notifData.notifications) {
           setNotifications(notifData.notifications);
         }
-        if (notifData?.snapshot?.unread_count !== undefined) {
+        if (notifData.snapshot?.unread_count !== undefined) {
           setUnreadBadgeCount(notifData.snapshot.unread_count);
         }
       }
@@ -272,6 +326,7 @@ export default function App() {
       console.error('Error fetching app data:', err);
     } finally {
       setIsLoadingFeed(false);
+      setIsAuthResolved(true);
     }
   };
 
@@ -410,7 +465,15 @@ export default function App() {
       setPosts((prev) => {
         const exists = prev.some((p) => p.id === enriched.id);
         if (exists) {
-          return prev.map((p) => (p.id === enriched.id ? enriched : p));
+          return prev.map((p) => p.id === enriched.id ? {
+            ...p,
+            ...enriched,
+            customDescription: enriched.customDescription ?? p.customDescription,
+            autoDescription: enriched.autoDescription ?? p.autoDescription,
+            user: enriched.user ?? p.user,
+            trade: enriched.trade ?? p.trade,
+            strategy: enriched.strategy ?? p.strategy
+          } : p);
         }
         return [enriched, ...prev];
       });
@@ -826,6 +889,17 @@ export default function App() {
     }} />;
   }
 
+  if (!isAuthResolved) {
+    return (
+      <div className="min-h-screen bg-[#050505] text-neutral-100 flex items-center justify-center">
+        <div className="flex items-center gap-3 text-sm text-neutral-400" role="status" aria-live="polite">
+          <span className="w-4 h-4 rounded-full border-2 border-amber-400 border-t-transparent animate-spin" />
+          Memulihkan sesi...
+        </div>
+      </div>
+    );
+  }
+
   if (publicInfoPage) {
     return <PublicInfoPage kind={publicInfoPage} onBack={() => { window.history.pushState({}, document.title, '/'); setPublicInfoPage(null); }} onNavigate={(path) => { window.history.pushState({}, document.title, path); setPublicInfoPage(path.slice(1) as 'about' | 'pricing' | 'faq'); }} onOpenLogin={() => { window.history.pushState({}, document.title, '/'); setPublicInfoPage(null); setIsAuthModalOpen(true); }} />;
   }
@@ -852,11 +926,11 @@ export default function App() {
         }}
         onOpenPromotion={() => {
           setPerformanceUsername(null);
-          setPromoterUsername(currentUser ? currentUser.username : 'alex_trader');
+          setPromoterUsername(currentUser ? currentUser.username : 'Master_Reversal');
           setIsPromotionViewOpen(true);
           setIsAdminDashboardOpen(false);
           setIsSettingsOpen(false);
-          window.history.pushState({}, document.title, `/@${currentUser ? currentUser.username : 'alex_trader'}`);
+          window.history.pushState({}, document.title, `/@${currentUser ? currentUser.username : 'Master_Reversal'}`);
         }}
         onOpenAdmin={() => {
           setPerformanceUsername(null);
@@ -941,64 +1015,68 @@ export default function App() {
             }}
           />
         ) : currentTab === 'feed' ? (
-          <FeedView
-            posts={posts}
-            currentUser={currentUser}
-            isLoading={isLoadingFeed}
-            hasMore={hasMorePosts}
-            isLoadingMore={isLoadingMore}
-            onLoadMore={handleLoadMorePosts}
-            onUnlockPost={handleUnlockPost}
-            onOpenDetail={(post) => setSelectedDetailPost(post)}
-            onOpenFollowSetup={(post) => {
-              requireAuth('Masuk untuk mirror follow trade', () => {
-                setSelectedFollowSetupPost(post);
-              });
-            }}
-            onOpenAskAI={(post) => {
-              requireAuth('Tanya Gemini AI untuk validasi setup teknikal', () => {
-                setSelectedAskAIPost(post);
-              });
-            }}
-            onOpenComments={(post) => setSelectedCommentsPost(post)}
-            onToggleLike={handleToggleLike}
-            onToggleSave={handleToggleSave}
-            onToggleFollow={handleToggleFollow}
-            onEditDescription={(post) => setSelectedEditDescPost(post)}
-            onViewProfile={(username) => {
-              setViewingProfileUsername(username);
-              setPerformanceUsername(null);
-              window.history.pushState({}, document.title, `/u/${encodeURIComponent(username)}`);
-              setCurrentTab('profile');
-            }}
-            onOpenPerformance={(username) => {
-              setPerformanceUsername(username);
-              window.history.pushState({}, document.title, `/u/${encodeURIComponent(username)}/performance`);
-            }}
-            onRefreshFeed={fetchInitialData}
-            onOpenLogin={() => {
-              setAuthPromptReason(null);
-              setIsAuthModalOpen(true);
-            }}
-          />
+          <ErrorBoundary fallbackMessage="Terjadi kesalahan saat memuat Halaman Utama (Feed).">
+            <FeedView
+              posts={posts}
+              currentUser={currentUser}
+              isLoading={isLoadingFeed}
+              hasMore={hasMorePosts}
+              isLoadingMore={isLoadingMore}
+              onLoadMore={handleLoadMorePosts}
+              onUnlockPost={handleUnlockPost}
+              onOpenDetail={(post) => setSelectedDetailPost(post)}
+              onOpenFollowSetup={(post) => {
+                requireAuth('Masuk untuk mirror follow trade', () => {
+                  setSelectedFollowSetupPost(post);
+                });
+              }}
+              onOpenAskAI={(post) => {
+                requireAuth('Tanya Gemini AI untuk validasi setup teknikal', () => {
+                  setSelectedAskAIPost(post);
+                });
+              }}
+              onOpenComments={(post) => setSelectedCommentsPost(post)}
+              onToggleLike={handleToggleLike}
+              onToggleSave={handleToggleSave}
+              onToggleFollow={handleToggleFollow}
+              onEditDescription={(post) => setSelectedEditDescPost(post)}
+              onViewProfile={(username) => {
+                setViewingProfileUsername(username);
+                setPerformanceUsername(null);
+                window.history.pushState({}, document.title, `/u/${encodeURIComponent(username)}`);
+                setCurrentTab('profile');
+              }}
+              onOpenPerformance={(username) => {
+                setPerformanceUsername(username);
+                window.history.pushState({}, document.title, `/u/${encodeURIComponent(username)}/performance`);
+              }}
+              onRefreshFeed={fetchInitialData}
+              onOpenLogin={() => {
+                setAuthPromptReason(null);
+                setIsAuthModalOpen(true);
+              }}
+            />
+          </ErrorBoundary>
         ) : currentTab === 'explore' ? (
-          <ExploreView
-            users={users}
-            posts={posts}
-            currentUser={currentUser}
-            onViewProfile={(username) => {
-              setViewingProfileUsername(username);
-              setPerformanceUsername(null);
-              window.history.pushState({}, document.title, `/u/${encodeURIComponent(username)}`);
-              setCurrentTab('profile');
-            }}
-            onToggleFollow={handleToggleFollow}
-            onOpenDetail={(post) => setSelectedDetailPost(post)}
-            onOpenPromotionPage={(username) => {
-              setPromoterUsername(username);
-              setIsPromotionViewOpen(true);
-            }}
-          />
+          <ErrorBoundary fallbackMessage="Terjadi kesalahan saat memuat Halaman Explore.">
+            <ExploreView
+              users={users}
+              posts={posts}
+              currentUser={currentUser}
+              onViewProfile={(username) => {
+                setViewingProfileUsername(username);
+                setPerformanceUsername(null);
+                window.history.pushState({}, document.title, `/u/${encodeURIComponent(username)}`);
+                setCurrentTab('profile');
+              }}
+              onToggleFollow={handleToggleFollow}
+              onOpenDetail={(post) => setSelectedDetailPost(post)}
+              onOpenPromotionPage={(username) => {
+                setPromoterUsername(username);
+                setIsPromotionViewOpen(true);
+              }}
+            />
+          </ErrorBoundary>
         ) : currentTab === 'dashboard' ? (
           <DashboardView
             currentUser={currentUser}
@@ -1152,24 +1230,26 @@ export default function App() {
 
       {/* 1. Trade Detail Modal */}
       {selectedDetailPost && (
-        <TradeDetailModal
-          post={selectedDetailPost}
-          currentUser={currentUser}
-          onClose={() => setSelectedDetailPost(null)}
-          onUnlock={handleUnlockPost}
-          onOpenFollowSetup={(post) => {
-            setSelectedDetailPost(null);
-            requireAuth('Masuk untuk follow trade', () => {
-              setSelectedFollowSetupPost(post);
-            });
-          }}
-          onOpenAskAI={(post) => {
-            setSelectedDetailPost(null);
-            requireAuth('Tanya AI untuk setup ini', () => {
-              setSelectedAskAIPost(post);
-            });
-          }}
-        />
+        <ErrorBoundary fallbackMessage="Terjadi kesalahan saat memuat detail trade.">
+          <TradeDetailModal
+            post={selectedDetailPost}
+            currentUser={currentUser}
+            onClose={() => setSelectedDetailPost(null)}
+            onUnlock={handleUnlockPost}
+            onOpenFollowSetup={(post) => {
+              setSelectedDetailPost(null);
+              requireAuth('Masuk untuk follow trade', () => {
+                setSelectedFollowSetupPost(post);
+              });
+            }}
+            onOpenAskAI={(post) => {
+              setSelectedDetailPost(null);
+              requireAuth('Tanya AI untuk setup ini', () => {
+                setSelectedAskAIPost(post);
+              });
+            }}
+          />
+        </ErrorBoundary>
       )}
 
       {/* 2. Follow Setup Modal */}
@@ -1261,7 +1341,7 @@ export default function App() {
           }}
           onTopupSuccess={(newBalance) => {
             if (currentUser) {
-              setCurrentUser({ ...currentUser, energyBalance: newBalance, energy: newBalance });
+              setCurrentUser({ ...currentUser, energyBalance: newBalance });
             }
           }}
         />
@@ -1328,8 +1408,7 @@ export default function App() {
           onWithdrawalSuccess={(newBalance) => {
             setCurrentUser({
               ...currentUser,
-              energyBalance: newBalance,
-              energy: newBalance
+              energyBalance: newBalance
             });
           }}
         />
@@ -1364,6 +1443,41 @@ export default function App() {
           setIsAuthModalOpen(true);
         }}
       />
+
+      {/* 13. Occupied cTrader Account Security Modal Notice */}
+      {occupiedCTraderNotice && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-in fade-in duration-200">
+          <div className="bg-[#140909] border border-rose-500/50 rounded-3xl p-6 max-w-md w-full text-center shadow-2xl shadow-rose-500/20 space-y-4">
+            <div className="w-16 h-16 rounded-2xl bg-rose-500/20 border border-rose-500/40 text-rose-400 flex items-center justify-center mx-auto text-2xl font-bold shadow-inner">
+              🔒
+            </div>
+            <div>
+              <h3 className="text-lg font-black text-rose-300">Akun cTrader Sudah Terhubung!</h3>
+              <p className="text-xs text-neutral-300 mt-2 leading-relaxed">
+                Akun cTrader ID (<span className="font-mono text-white font-bold">{occupiedCTraderNotice.accountId}</span>) saat ini sudah dikaitkan dengan pengguna:
+              </p>
+            </div>
+
+            <div className="inline-block bg-rose-500/15 border border-rose-500/40 text-rose-300 font-mono font-bold px-4 py-1.5 rounded-full text-sm">
+              {occupiedCTraderNotice.occupiedBy.startsWith('@') ? occupiedCTraderNotice.occupiedBy : `@${occupiedCTraderNotice.occupiedBy}`}
+            </div>
+
+            <div className="bg-[#1c0d0d] border border-white/5 rounded-xl p-3 text-[11px] text-neutral-400 text-left space-y-1">
+              <div className="font-semibold text-rose-400">🛡️ Kebijakan Keamanan Transaksi:</div>
+              <p className="text-neutral-300 leading-relaxed">
+                Satu akun cTrader hanya dapat terhubung ke satu pengguna Scrolic untuk mencegah konflik eksekusi dan duplikasi posisi ganda. Harap lepaskan koneksi dari akun pengguna tersebut sebelum mengaitkannya ke akun ini.
+              </p>
+            </div>
+
+            <button
+              onClick={() => setOccupiedCTraderNotice(null)}
+              className="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-extrabold text-xs shadow-lg shadow-rose-600/30 transition-all active:scale-95 cursor-pointer"
+            >
+              Saya Mengerti & Tutup
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

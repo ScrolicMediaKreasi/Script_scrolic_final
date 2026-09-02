@@ -3,6 +3,7 @@ import { Plus, TrendingUp, TrendingDown, Zap, X, ShieldCheck, ArrowRight, Eye } 
 import { FeedPost, User } from '../types';
 import { triggerHaptic } from '../utils/haptics';
 import { formatPrice } from '../utils/formatters';
+import { getStrategy } from '../data/strategies';
 
 interface LiveTradeStoriesProps {
   posts: FeedPost[];
@@ -29,7 +30,7 @@ export const LiveTradeStories: React.FC<LiveTradeStoriesProps> = ({
     onSelectStoryPost(post);
   };
 
-  const myPost = currentUser ? posts.find(p => p.user.id === currentUser.id) : null;
+  const myPost = currentUser ? safePosts.find(p => p?.user?.id === currentUser.id || p?.userId === currentUser.id) : null;
 
   return (
     <div className="w-full bg-[#061009] border-b border-[#18633c]/25 py-3 px-2 select-none shadow-inner">
@@ -71,10 +72,27 @@ export const LiveTradeStories: React.FC<LiveTradeStoriesProps> = ({
 
         {/* Story Bubbles: Active Live Traders */}
         {displayStories.map((post) => {
-          const { user, trade, strategy } = post;
+          if (!post) return null;
+          const user = post.user || {
+            id: post.userId || 'trader',
+            username: post.username || 'trader',
+            displayName: post.username || 'Trader',
+            avatar: post.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
+            subscriptionTier: 'free'
+          };
+          const trade = post.trade || {
+            symbol: post.symbol || 'XAUUSD',
+            direction: post.position_type || 'BUY',
+            profitUSD: post.profit || 0,
+            pips: post.pips || 0,
+            status: post.status || 'OPEN',
+            strategyId: post.strategy_id || 'breakout'
+          };
+          const strategy = post.strategy || getStrategy(post.strategy_id || trade.strategyId || 'breakout');
+
           const isProfit = (trade?.profitUSD || 0) >= 0;
-          const isBuy = trade?.direction === 'BUY';
-          const isPro = user.subscriptionTier !== 'free';
+          const isBuy = (trade?.direction || 'BUY') === 'BUY';
+          const isPro = Boolean(user.subscriptionTier && user.subscriptionTier !== 'free');
 
           return (
             <div
@@ -103,8 +121,8 @@ export const LiveTradeStories: React.FC<LiveTradeStoriesProps> = ({
                 >
                   <div className="w-full h-full rounded-full bg-[#0d0d0d] p-[2px] overflow-hidden flex items-center justify-center relative">
                     <img
-                      src={user.avatar}
-                      alt={user.displayName}
+                      src={user.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80'}
+                      alt={user.displayName || 'Trader'}
                       referrerPolicy="no-referrer"
                       className="w-full h-full object-cover rounded-full group-hover:scale-105 transition-transform"
                     />
@@ -133,7 +151,7 @@ export const LiveTradeStories: React.FC<LiveTradeStoriesProps> = ({
                 </span>
               </div>
 
-              {/* Trader Name & Pips */}
+              {/* Trader Name & Profit */}
               <div className="flex flex-col items-center max-w-[68px]">
                 <span className="text-[11px] font-semibold text-neutral-200 group-hover:text-amber-300 truncate w-full text-center">
                   {user.username}
@@ -141,7 +159,7 @@ export const LiveTradeStories: React.FC<LiveTradeStoriesProps> = ({
                 <span className={`text-[9px] font-mono font-bold leading-none ${
                   isProfit ? 'text-emerald-400' : 'text-rose-400'
                 }`}>
-                  {isProfit ? '+' : ''}{(trade?.pips ?? 0).toFixed(0)}p
+                  {isProfit ? '+$' : '-$'}{Math.abs(trade?.profitUSD ?? 0).toFixed(0)}
                 </span>
               </div>
             </div>
@@ -150,60 +168,76 @@ export const LiveTradeStories: React.FC<LiveTradeStoriesProps> = ({
       </div>
 
       {/* Optional Instagram Story Quick Modal Viewer */}
-      {activeStoryModalPost && (
-        <div 
-          className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-200"
-          onClick={() => setActiveStoryModalPost(null)}
-        >
+      {activeStoryModalPost && (() => {
+        const activeUser = activeStoryModalPost.user || {
+          username: activeStoryModalPost.username || 'trader',
+          displayName: activeStoryModalPost.displayName || 'Trader',
+          avatar: activeStoryModalPost.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
+          isVerified: false
+        };
+        const activeTrade = activeStoryModalPost.trade || {
+          symbol: activeStoryModalPost.symbol || 'XAUUSD',
+          direction: activeStoryModalPost.position_type || 'BUY',
+          profitUSD: activeStoryModalPost.profit || 0,
+          pips: activeStoryModalPost.pips || 0,
+          strategyId: activeStoryModalPost.strategy_id || 'breakout'
+        };
+        const activeStrategy = activeStoryModalPost.strategy || getStrategy(activeStoryModalPost.strategy_id || activeTrade.strategyId || 'breakout');
+        const isProfit = (activeTrade.profitUSD ?? 0) >= 0;
+
+        return (
           <div 
-            className="w-full max-w-sm bg-[#111111] border border-[#262626] rounded-3xl overflow-hidden shadow-2xl relative animate-in zoom-in-95 duration-200"
-            onClick={(e) => e.stopPropagation()}
+            className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-200"
+            onClick={() => setActiveStoryModalPost(null)}
           >
-            {/* Story Header */}
-            <div className="p-4 bg-gradient-to-b from-[#1c1c1c] to-transparent flex items-center justify-between border-b border-white/5">
-              <div className="flex items-center gap-2.5">
-                <div className="w-10 h-10 rounded-full p-[2px] bg-gradient-to-tr from-amber-400 to-emerald-400">
-                  <img
-                    src={activeStoryModalPost.user.avatar}
-                    alt={activeStoryModalPost.user.displayName}
-                    referrerPolicy="no-referrer"
-                    className="w-full h-full object-cover rounded-full"
-                  />
-                </div>
-                <div>
-                  <div className="flex items-center gap-1">
-                    <span className="font-bold text-xs text-white">{activeStoryModalPost.user.displayName}</span>
-                    {activeStoryModalPost.user.isVerified && <ShieldCheck className="w-3.5 h-3.5 text-sky-400" />}
+            <div 
+              className="w-full max-w-sm bg-[#111111] border border-[#262626] rounded-3xl overflow-hidden shadow-2xl relative animate-in zoom-in-95 duration-200"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Story Header */}
+              <div className="p-4 bg-gradient-to-b from-[#1c1c1c] to-transparent flex items-center justify-between border-b border-white/5">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-10 h-10 rounded-full p-[2px] bg-gradient-to-tr from-amber-400 to-emerald-400">
+                    <img
+                      src={activeUser.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80'}
+                      alt={activeUser.displayName || 'Trader'}
+                      referrerPolicy="no-referrer"
+                      className="w-full h-full object-cover rounded-full"
+                    />
                   </div>
-                  <span className="text-[10px] text-neutral-400">@{activeStoryModalPost.user.username} - Live Signal</span>
+                  <div>
+                    <div className="flex items-center gap-1">
+                      <span className="font-bold text-xs text-white">{activeUser.displayName}</span>
+                      {activeUser.isVerified && <ShieldCheck className="w-3.5 h-3.5 text-sky-400" />}
+                    </div>
+                    <span className="text-[10px] text-neutral-400">@{activeUser.username} - Live Signal</span>
+                  </div>
                 </div>
-              </div>
-              <button
-                onClick={() => setActiveStoryModalPost(null)}
-                className="w-8 h-8 rounded-full bg-neutral-800/80 hover:bg-neutral-700 text-neutral-400 hover:text-white flex items-center justify-center transition-colors cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Story Body */}
-            <div className="p-5 space-y-4 text-center">
-              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-bold">
-                <Zap className="w-3.5 h-3.5" />
-                <span>{activeStoryModalPost.strategy.name}</span>
+                <button
+                  onClick={() => setActiveStoryModalPost(null)}
+                  className="w-8 h-8 rounded-full bg-neutral-800/80 hover:bg-neutral-700 text-neutral-400 hover:text-white flex items-center justify-center transition-colors cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
               </div>
 
-              <div>
-                <div className="text-3xl font-black text-white font-display tracking-tight">
-                  {activeStoryModalPost.trade.symbol}
+              {/* Story Body */}
+              <div className="p-5 space-y-4 text-center">
+                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-bold">
+                  <Zap className="w-3.5 h-3.5" />
+                  <span>{activeStrategy.name}</span>
                 </div>
-                <div className={`text-sm font-bold font-mono mt-1 ${
-                  (activeStoryModalPost.trade.profitUSD ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                }`}>
-                  {activeStoryModalPost.trade.direction} - {(activeStoryModalPost.trade.profitUSD ?? 0) >= 0 ? '+' : ''}
-                  {(activeStoryModalPost.trade.pips ?? 0).toFixed(1)} Pips (${(activeStoryModalPost.trade.profitUSD ?? 0).toFixed(2)})
+
+                <div>
+                  <div className="text-3xl font-black text-white font-display tracking-tight">
+                    {activeTrade.symbol}
+                  </div>
+                  <div className={`text-sm font-bold font-mono mt-1 ${
+                    isProfit ? 'text-emerald-400' : 'text-rose-400'
+                  }`}>
+                    {activeTrade.direction} - {isProfit ? '+' : ''}${(activeTrade.profitUSD ?? 0).toFixed(2)}
+                  </div>
                 </div>
-              </div>
 
               <div className="bg-[#181818] p-3 rounded-2xl border border-[#2a2a2a] text-xs text-neutral-300 text-left">
                 {activeStoryModalPost.customDescription || activeStoryModalPost.autoDescription}
@@ -242,7 +276,8 @@ export const LiveTradeStories: React.FC<LiveTradeStoriesProps> = ({
             </div>
           </div>
         </div>
-      )}
+      );
+    })()}
     </div>
   );
 };

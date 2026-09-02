@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, Send, Heart, MessageSquare } from 'lucide-react';
 import { FeedPost, User, Comment } from '../types';
+import { safeAvatarUrl, handleAvatarError } from '../utils/avatar';
 
 interface CommentsDrawerProps {
   post: FeedPost | null;
@@ -85,8 +86,9 @@ export const CommentsDrawer: React.FC<CommentsDrawerProps> = ({
             comments.map((c) => (
               <div key={c.id} className="flex gap-2.5 items-start">
                 <img 
-                  src={c.user.avatar} 
-                  alt={c.user.username} 
+                  src={safeAvatarUrl(c.user.avatar, c.user.username)}
+                  alt={c.user.username}
+                  onError={(event) => handleAvatarError(event, c.user.username, c.user.avatar)}
                   className="w-8 h-8 rounded-full object-cover border border-[#2a2a2a] mt-0.5 flex-shrink-0"
                 />
                 <div className="flex-1 bg-[#111111] border border-[#1f1f1f] rounded-xl p-2.5">

@@ -100,6 +100,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         body: JSON.stringify({
           email: emailInput.trim(),
           password: passwordInput,
+          referralCode: referralCode?.trim() || localStorage.getItem('scrolic_ref_code') || '',
           termsAccepted: true,
           privacyAccepted: true,
           legalVersion: '2026-02-26'

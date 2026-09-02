@@ -9,14 +9,19 @@ export interface LivePositionUpdate {
   tradeId?: string;
   positionId?: string;
   symbol: string;
+  entryPrice?: number;
+  entry?: number;
   currentPrice: number;
-  progress: number;
-  profit: number;
+  current?: number;
+  direction?: 'BUY' | 'SELL';
+  side?: 'BUY' | 'SELL';
+  progress?: number;
+  profit?: number;
   profitUsd?: number;
-  profitPercent: number;
-  pips: number;
+  profitPercent?: number;
+  pips?: number;
   volumeLot?: number;
-  status: 'OPEN' | 'CLOSED';
+  status?: 'OPEN' | 'CLOSED';
 }
 
 export interface PositionClosedPayload {
@@ -78,20 +83,20 @@ export interface CTraderPositionUpdatePayload {
   eventId?: string;
   sequence?: number;
   timestamp?: number;
-  positionId: string;
+  positionId?: string;
   postId?: string;
   tradeId?: string;
   symbol: string;
-  side: 'BUY' | 'SELL';
+  side?: 'BUY' | 'SELL';
   direction?: 'BUY' | 'SELL';
-  entry: number;
-  current: number;
+  entry?: number;
+  current?: number;
   currentPrice?: number;
   bid?: number;
   ask?: number;
-  pips: number;
+  pips?: number;
   volumeLot?: number;
-  profitUsd: number;
+  profitUsd?: number;
   profit?: number;
   profitPercent?: number;
   sl?: number;

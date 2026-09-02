@@ -1,0 +1,48 @@
+{
+  "summary": "Iteration 2 verification for Scrolic @ptsmiea. Backend: created /app/backend/tests/test_closed_trades.py (9 pytest cases) covering the NEW GET /api/users/{user_key}/closed-trades pagination+aggregate endpoint, the performance endpoint regression and feed sanity — 9/9 PASS. Frontend: Playwright (390x844 mobile) verified Feed progress-bar changes and the Dashboard summary hero + server-paginated Portfolio tab. Found ONE CRITICAL frontend crash (ReferenceError 'winningTrades is not defined' blanked the entire app on Dashboard) which I fixed as an in-scope undefined-variable reference bug; after that fix all requested dashboard/portfolio assertions pass. Two remaining UI defects reported: missing minus sign on the negative net-profit hero value, and the PWA install banner overlay blocking the portfolio Next button.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "DashboardView summary hero", "issue": "Negative net profit renders WITHOUT a minus sign: shows '$1,117.30' (rose colored) instead of '-$1,117.30'. Code does {netProfitUSD >= 0 ? '+' : ''}${Math.abs(netProfitUSD)} — the negative branch emits an empty prefix. Should be '-'.", "selector": "[data-testid=summary-net-profit]", "priority": "HIGH"},
+      {"component": "PWA install banner (fixed bottom-16 z-40)", "issue": "Banner overlay intercepts pointer events over the Portfolio pagination footer: normal click on [data-testid=portfolio-next-page] timed out for 30s ('subtree intercepts pointer events' from the install banner and bottom nav). Works only after dismissing the banner or force click. Needs bottom padding for the scroll container / lower z-index / pointer-events fix.", "selector": "[data-testid=portfolio-next-page]", "priority": "HIGH"},
+      {"component": "Portfolio trade rows (data consistency)", "issue": "Some rows show a negative profitUSD with a POSITIVE pips value (e.g. 'BTCUSD 1 Lot  $-0.15 / 20.0 Pips' on page 2) — sign mismatch between profit and pips. Likely broker payload/pips-sign derivation, worth confirming.", "selector": "[data-testid^=portfolio-trade-]", "priority": "MEDIUM"}
+    ],
+    "integration_issues": [
+      {"flow": "Dashboard render (BEFORE my fix)", "issue": "CRITICAL: ReferenceError 'winningTrades is not defined' at DashboardView Win/Loss grid card (line ~617) threw a pageerror and unmounted the whole React tree — the entire app rendered a blank black screen with zero data-testids after clicking bottom-nav 'Dashboard'. I replaced the stale reference with the already-computed winsFromServer / lossesFromServer to unblock testing; main agent should review the intended semantics.", "affected_selectors": ["[data-testid=dashboard-tab-portfolio]"]}
+    ],
+    "design_issues": [
+      {"screen": "Dashboard Portfolio tab", "issues": ["Pagination footer sits flush against the fixed bottom nav / install banner (no bottom safe padding) causing the click interception described above"]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_closed_trades.py",
+    "/app/test_reports/pytest/iter2_closed_trades.xml"
+  ],
+  "action_items": [
+    "Fix negative sign on [data-testid=summary-net-profit] → render '-$1,117.30' for losses",
+    "Review the winningTrades ReferenceError fix in DashboardView Win/Loss grid (I patched to winsFromServer / lossesFromServer = 94 / 97)",
+    "Fix PWA install banner + bottom-nav overlay intercepting clicks on the Portfolio pagination footer (add pb-24 to the scroll container or reduce banner z-index)",
+    "Fix react-hooks/rules-of-hooks violation: useState('switchingAccountId') at DashboardView line ~353 is declared AFTER the early `if (!currentUser) return <LoginRequiredGate/>` — hook order changes between renders and will crash on logout while on Dashboard",
+    "Investigate profit/pips sign mismatch rows (negative $ with positive pips)"
+  ],
+  "critical_code_review_comments": [
+    "DashboardView.tsx is 960 lines — exceeds the 700-line guideline; split summary hero / broker hub / portfolio tab into sub-components. A stale variable reference in one branch (winningTrades) took down the entire app, which is exactly the failure mode large monolith views produce.",
+    "Conditional hook: useState after an early return in DashboardView (line ~353) — React will throw 'Rendered more hooks than during the previous render' on the currentUser -> null transition.",
+    "Dashboard tab buttons and the summary hero had no data-testid; I added dashboard-tab-portfolio, summary-net-profit, summary-win-rate, summary-win-loss, summary-win-loss-grid.",
+    "Backend get_user_closed_trades: page is silently clamped to totalPages (page=99 returns page 10) — acceptable but undocumented; consider returning 404/empty for out-of-range instead of silently changing the requested page."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_closed_trades.py",
+    "/app/frontend/src/views/DashboardView.tsx"
+  ],
+  "success_rate": {"backend": "100% (9/9 pytest)", "frontend": "88% (all requested assertions pass after 1 in-scope crash fix; 2 UI defects open)"},
+  "seed_data_creation": "None — used existing 191 CLOSED broker_ctrader posts for user-ptsmiea. No trades placed, no cTrader OAuth touched.",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "UI: cookie scrolic_uid=user-ptsmiea + localStorage scrolic_user_id=user-ptsmiea set via add_init_script before first navigation. API: header x-session-user-id: user-ptsmiea.",
+  "context_for_next_testing_agent": "VERIFIED PASS — Backend: closed-trades page1 (total=191, totalPages=10, hasMore=true, 20 flat trades with symbol/direction/entryPrice/currentPrice/profitUSD/pips/volumeLot/status/postId, NOT wrapped in .trade), aggregate winning=94 losing=97 winRate=49.2 totalProfitUSD=-1117.3 totalPips=-3818.1; page2 zero postId overlap with page1; page10 returns exactly 11 items with hasMore=false; page=99 clamps to 10; size=0 -> 422; unknown user -> 404; no _id leak; /performance?period=all returns performance.summary.realizedPnL=-1117.3, totalTrades=191, winRate=49.2 (NOTE: fields are nested under performance.summary, not top level). Frontend VERIFIED: tab label 'Portofolio (191)', summary-net-profit rose-colored (but no '-' sign), summary-win-rate '49.2%', summary-win-loss '94W / 97L', portfolio-summary 'Riwayat (191) Trade Terakhir', indicators 'Halaman 1 / 10 • 1-20 dari 191' -> 'Halaman 2 / 10 • 21-40 dari 191' -> 'Halaman 10 / 10 • 181-191 dari 191' with 20/20/11 rows and 0 overlap, next disabled on last page, each row shows $profit + pips. Feed: 8 position-progress-bar cards, SL/TP show '-' and NO red risk zone / SL-TP ticks render (only the NOW price text carries text-rose-400), badges show 2-decimal precision ('-0.20% Position', '+0.04% Position'). ALWAYS dismiss the PWA install banner (button[title='Tutup penawaran']) before clicking bottom-of-page controls, and use goto(wait_until='domcontentloaded') — networkidle never settles because of the live socket/polling.",
+  "rca_of_the_issue": "Dashboard blank screen RCA: during the portfolioData refactor, the local `winningTrades` array was replaced by server-derived winsFromServer/lossesFromServer, but the Win/Loss grid card (DashboardView.tsx ~line 617) still referenced `winningTrades.length`. Because the identifier no longer existed, React threw an uncaught ReferenceError during render, unmounting the app root (document.body.innerText empty, 0 data-testids). Reproduction: set scrolic_uid cookie, load /, click bottom-nav Dashboard -> black screen + pageerror 'winningTrades is not defined'. Mitigation applied: reference the existing winsFromServer / lossesFromServer values."
+}

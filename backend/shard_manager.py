@@ -92,6 +92,10 @@ class ShardManager:
     def _clean_numeric_account_id(self, raw_id: Any) -> int:
         return self.shards[0]._clean_numeric_account_id(raw_id)
 
+    def is_account_authenticated(self, account_id: Any) -> bool:
+        shard, _ = self._shard_for(account_id)
+        return shard.is_account_authenticated(account_id)
+
     @property
     def state(self):
         """Aggregate state across shards. Returns AUTHENTICATED only if EVERY

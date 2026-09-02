@@ -209,10 +209,14 @@ export function ingestProtoSymbols(symbols: ProtoOASymbol[]): void {
  * Resolves ProtoOASymbol dynamically by symbol name or ID
  */
 export function getProtoSymbol(symbolNameOrId: string | number = 'XAUUSD'): ProtoOASymbol {
-  const key = String(symbolNameOrId).toUpperCase().replace('/', '').trim();
+  const rawKey = String(symbolNameOrId).toUpperCase().replace('/', '').trim();
+  const key = rawKey.split('.')[0].split('_')[0].split('-')[0];
   
   if (PROTO_SYMBOL_REGISTRY.has(key)) {
     return PROTO_SYMBOL_REGISTRY.get(key)!;
+  }
+  if (PROTO_SYMBOL_REGISTRY.has(rawKey)) {
+    return PROTO_SYMBOL_REGISTRY.get(rawKey)!;
   }
 
   // Heuristic dynamic builder if symbol is not yet in registry
@@ -228,7 +232,7 @@ export function getProtoSymbol(symbolNameOrId: string | number = 'XAUUSD'): Prot
   if (key.includes('JPY')) {
     return DEFAULT_PROTO_SYMBOLS.USDJPY;
   }
-  if (key.length === 6 && (key.endsWith('USD') || key.startsWith('EUR') || key.startsWith('GBP'))) {
+  if (key.length >= 6 && (key.endsWith('USD') || key.startsWith('EUR') || key.startsWith('GBP') || key.startsWith('AUD'))) {
     return DEFAULT_PROTO_SYMBOLS.EURUSD;
   }
 
@@ -275,7 +279,6 @@ export function getTickSize(symbol: ProtoOASymbol | string = 'XAUUSD'): number {
 export function getContractSize(symbol: ProtoOASymbol | string = 'XAUUSD'): number {
   const proto = typeof symbol === 'string' ? getProtoSymbol(symbol) : symbol;
   if (typeof proto.lotSize === 'number' && proto.lotSize > 0) {
-    // If given in cents (e.g. 10000000 cents = 100,000 units), normalize
     if (proto.lotSize >= 10000000) {
       return proto.lotSize / 100;
     }
@@ -320,19 +323,41 @@ export function getPipValue(
  */
 export function lotToCTraderVolume(lot: number, symbol: ProtoOASymbol | string = 'XAUUSD'): number {
   const proto = typeof symbol === 'string' ? getProtoSymbol(symbol) : symbol;
+  const key = String(typeof symbol === 'string' ? symbol : proto.symbolName).toUpperCase();
+
+  if (key.includes('BTC') || key.includes('ETH')) {
+    return Math.round(lot * 100);
+  }
+  if (key.includes('XAU') || key.includes('GOLD')) {
+    return Math.round(lot * 10000);
+  }
   const contractSize = getContractSize(proto);
   return Math.round(lot * contractSize * 100);
 }
 
 /**
  * Converts cTrader Open API volume (cents) to Standard Lot
- * Formula: lot = volumeInCents / (contractSize * 100)
+ * Formula: lot = volumeInCents / scale
  */
 export function cTraderVolumeToLot(volumeInCents: number, symbol: ProtoOASymbol | string = 'XAUUSD'): number {
   const proto = typeof symbol === 'string' ? getProtoSymbol(symbol) : symbol;
+  const key = String(typeof symbol === 'string' ? symbol : proto.symbolName).toUpperCase();
+
+  if (volumeInCents <= 0) return 0.01;
+
+  if (key.includes('BTC') || key.includes('ETH')) {
+    const lot = volumeInCents / 100;
+    return Number(Math.max(0.01, lot).toFixed(2));
+  }
+  if (key.includes('XAU') || key.includes('GOLD')) {
+    const lot = volumeInCents / 10000;
+    return Number(Math.max(0.01, lot).toFixed(2));
+  }
+
   const contractSize = getContractSize(proto);
   if (contractSize <= 0) return 0.01;
-  return Number((volumeInCents / (contractSize * 100)).toFixed(2));
+  const lot = volumeInCents / (contractSize * 100);
+  return Number(Math.max(0.01, lot).toFixed(2));
 }
 
 /**

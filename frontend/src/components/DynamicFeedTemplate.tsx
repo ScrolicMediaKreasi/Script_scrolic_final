@@ -27,9 +27,11 @@ import {
   ArrowLeft,
   ArrowRight
 } from 'lucide-react';
-import { FeedPost, User } from '../types';
+import { FeedPost, Trade, User } from '../types';
+import { getStrategy } from '../data/strategies';
 import { PositionProgressBar } from './PositionProgressBar';
 import { formatPrice, maskPartialPrice } from '../utils/formatters';
+import { calculateCTraderPips } from '../utils/ctraderCalculations';
 import { triggerHaptic } from '../utils/haptics';
 import { updateSEOForFeedPost } from '../utils/seo';
 import { livePositionStore } from '../services/livePositionStore';
@@ -86,22 +88,82 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
   onEditDescription,
   onViewProfile
 }) => {
-  const { user, trade, strategy } = post;
-  const [localTrade, setLocalTrade] = useState(trade);
+  const DEFAULT_AVATAR = 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80';
+  const user = post.user || {
+    id: post.userId || 'trader',
+    username: post.username || 'trader',
+    displayName: post.username || 'Trader',
+    avatar: post.avatar || DEFAULT_AVATAR,
+    subscriptionTier: 'free',
+    isVerified: false,
+    role: 'user'
+  };
+
+  const avatarUrl = user.avatar && user.avatar.trim() !== '' ? user.avatar : DEFAULT_AVATAR;
+
+  const rawTrade = post.trade || {
+    id: post.trade_id || post.id,
+    cTraderPositionId: post.trade_id || post.id || 'pos-881',
+    accountId: post.account_id || '',
+    userId: post.user_id || post.userId || '',
+    symbol: post.symbol || 'XAUUSD',
+    direction: post.position_type || 'BUY',
+    volumeLot: post.lot || 1.0,
+    entryPrice: post.entry_price || post.trade?.entryPrice || 0,
+    currentPrice: post.current_price || post.trade?.currentPrice || post.entry_price || 0,
+    stopLoss: post.stop_loss || (post as any).stopLoss || post.trade?.stopLoss || 0,
+    takeProfit: post.take_profit || (post as any).takeProfit || post.trade?.takeProfit || 0,
+    profitUSD: post.profit || 0,
+    profitPercent: post.profit_percent || 0,
+    pips: post.pips || 0,
+    openTime: post.opened_at || new Date().toISOString(),
+    duration: post.duration || 'Live',
+    status: post.status || 'OPEN',
+    strategyId: post.strategy_id || 'breakout'
+  };
+
+  const strategy = post.strategy || getStrategy(post.strategy_id || rawTrade.strategyId || 'breakout');
+  const defaultStrategyNote = strategy.defaultNote || strategy.description;
+  const customDescription = post.customDescription || (post as any).custom_description;
+  const autoDescription = post.autoDescription || (post as any).auto_description;
+  const displayNote = customDescription || autoDescription || defaultStrategyNote;
+  const [localTrade, setLocalTrade] = useState<Trade>(rawTrade as Trade);
+  const trade = localTrade;
   const [isIntersecting, setIsIntersecting] = useState(false);
   const cardRef = useRef<HTMLElement>(null);
 
-  const isOwner = Boolean(currentUser && (currentUser.id === post.userId || currentUser.username === post.user.username));
-  const isPremiumUser = user.subscriptionTier !== 'free';
-  const isBuy = localTrade.direction === 'BUY';
-  const isProfit = (localTrade?.profitUSD ?? 0) >= 0;
-  const isOpen = localTrade.status === 'OPEN';
-  const isUnlocked = post.isUnlocked || isOwner || localTrade.status === 'CLOSED';
+  const isOwner = Boolean(currentUser && (currentUser.id === post.userId || currentUser.username === user.username));
+  const isPremiumUser = Boolean(user.subscriptionTier && user.subscriptionTier !== 'free');
+  const isBuy = (trade.direction || 'BUY') === 'BUY';
+  const isProfit = (trade?.profitUSD ?? 0) >= 0;
+  const isOpen = (trade.status || 'OPEN') === 'OPEN';
+  const isUnlocked = Boolean(post.isUnlocked || isOwner || trade.status === 'CLOSED');
 
-  // Sync prop updates
+  const displayProfitUSD = Number(localTrade.profitUSD ?? 0);
+  const isPositiveProfit = displayProfitUSD >= 0;
+
+  // Sync server snapshots only when the underlying trade identity changes.
+  // Otherwise the live tick state from the socket layer must remain the source of truth.
   useEffect(() => {
-    setLocalTrade(trade);
-  }, [trade]);
+    if (!post.trade) return;
+
+    setLocalTrade((prev) => {
+      const prevId = prev?.id ?? '';
+      const nextId = post.trade?.id ?? '';
+
+      if (prevId && nextId && prevId === nextId) {
+        const hasLiveTick = Number.isFinite(Number(prev.currentPrice)) && Number(prev.currentPrice) > 0;
+
+        // Keep the socket-driven tick as the source of truth for an already-open trade.
+        // Only accept the server snapshot when it is the first bootstrap or the live tick is empty.
+        if (hasLiveTick) {
+          return prev;
+        }
+      }
+
+      return post.trade;
+    });
+  }, [post.id, post.trade?.id, post.trade?.currentPrice, post.trade?.entryPrice, post.trade?.pips, post.trade?.profitUSD]);
 
   // Viewport Observer for Offscreen Realtime Pausing
   useEffect(() => {
@@ -122,24 +184,39 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
 
   // Isolated Localized WebSocket Subscription
   useEffect(() => {
-    if (trade.status !== 'OPEN' || !isIntersecting) return;
-    const keys = [post.id, trade.id, (trade as any).positionId].filter(Boolean);
+    if ((rawTrade.status || 'OPEN') !== 'OPEN' || !isIntersecting) return;
+    const keys = [post.id, rawTrade.id, (rawTrade as any).positionId, rawTrade.cTraderPositionId].filter(Boolean);
     const unsubs = keys.map((k) =>
       livePositionStore.subscribe(String(k), (update) => {
-        setLocalTrade((prev) => ({
-          ...prev,
-          currentPrice: update.currentPrice ?? prev.currentPrice,
-          pips: update.pips ?? prev.pips,
-          volumeLot: update.volumeLot ?? prev.volumeLot,
-          profitUSD: update.profitUsd ?? update.profit ?? prev.profitUSD,
-          profitPercent: update.profitPercent ?? prev.profitPercent,
-          progress: update.progress ?? prev.progress,
-          status: update.status ?? prev.status
-        }));
+        setLocalTrade((prev) => {
+          const rawEntry = Number(update.entryPrice ?? update.entry);
+          const rawCurrent = Number(update.currentPrice ?? update.current);
+          const nextEntry = Number.isFinite(rawEntry) && rawEntry > 0 ? rawEntry : prev.entryPrice;
+          const nextCurrent = Number.isFinite(rawCurrent) && rawCurrent > 0 ? rawCurrent : prev.currentPrice;
+          const nextSymbol = String(update.symbol || prev.symbol || 'XAUUSD');
+          const nextDirection = String((update as any).direction || (update as any).side || prev.direction || 'BUY').toUpperCase() as 'BUY' | 'SELL';
+          const nextPips = Number.isFinite(update.pips) && update.pips !== null
+            ? Number(update.pips)
+            : calculateCTraderPips(nextSymbol, nextEntry, nextCurrent, nextDirection);
+
+          return {
+            ...prev,
+            symbol: nextSymbol,
+            direction: nextDirection,
+            entryPrice: nextEntry,
+            currentPrice: nextCurrent,
+            pips: Number.isFinite(nextPips) ? nextPips : (prev.pips ?? 0),
+            volumeLot: update.volumeLot ?? prev.volumeLot,
+            profitUSD: update.profitUsd ?? update.profit ?? prev.profitUSD,
+            profitPercent: update.profitPercent ?? prev.profitPercent,
+            progress: update.progress ?? prev.progress,
+            status: update.status ?? prev.status
+          };
+        });
       })
     );
     return () => unsubs.forEach((unsub) => unsub());
-  }, [trade.status, isIntersecting, post.id, trade.id]);
+  }, [rawTrade.status, rawTrade.cTraderPositionId, isIntersecting, post.id, rawTrade.id]);
 
   const [copiedToast, setCopiedToast] = useState(false);
   const [doubleTapHeart, setDoubleTapHeart] = useState(false);
@@ -378,7 +455,7 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
               }
             >
               <img 
-                src={user.avatar} 
+                src={avatarUrl} 
                 alt={user.username} 
                 referrerPolicy="no-referrer"
                 onClick={(e) => {
@@ -418,15 +495,6 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
         {/* Status Badge & Dynamic Strategy Pill */}
         <div className="flex flex-col items-end gap-1.5 shrink-0">
           <div className="flex items-center gap-1.5">
-            {isOpen ? (
-              <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-black uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">
-                LIVE
-              </span>
-            ) : (
-              <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-black uppercase bg-neutral-800 text-neutral-400 border border-neutral-700">
-                CLOSE
-              </span>
-            )}
             {isOpen ? (
               <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
@@ -479,13 +547,13 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
             </span>
           </div>
 
-          {/* Floating P/L & Pips */}
+          {/* Floating P/L */}
           <div className="text-right">
-            <div className={`text-base font-bold font-mono ${isProfit ? 'text-emerald-400' : 'text-rose-400'}`}>
-              {isProfit ? '+' : ''}{(localTrade.pips ?? 0).toFixed(1)} Pips
+            <div className={`text-[1.5rem] font-black font-mono leading-none ${isPositiveProfit ? 'text-emerald-400' : 'text-rose-400'}`}>
+              {isPositiveProfit ? '+$' : '-$'}{Math.abs(displayProfitUSD).toFixed(2)}
             </div>
-            <div className="text-xs text-neutral-400 font-mono">
-              {isProfit ? '+$' : '-$'}{Math.abs(localTrade.profitUSD ?? 0).toFixed(2)} ({isProfit ? '+' : ''}{(localTrade.profitPercent ?? 0).toFixed(2)}%)
+            <div className="mt-1 text-xs text-neutral-400 font-mono">
+              ({isPositiveProfit ? '+' : ''}{(localTrade.profitPercent ?? 0).toFixed(2)}%)
             </div>
           </div>
         </div>
@@ -586,7 +654,7 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
         <div className="bg-[#141414] rounded-2xl p-3 border border-[#222222] text-xs leading-relaxed text-neutral-300">
           <div className="flex items-start justify-between gap-2">
             <p className="flex-1">
-              {post.customDescription || post.autoDescription}
+              {displayNote}
             </p>
             {isOwner && onEditDescription && (
               <button
@@ -604,7 +672,7 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
               </button>
             )}
           </div>
-          {post.customDescription && (
+          {customDescription && (
             <span className="block mt-1 text-[10px] text-amber-400/80 font-medium">
               Catatan khusus dari @{user.username}
             </span>
@@ -656,7 +724,7 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
                 onClick={(e) => {
                   e.stopPropagation();
                   triggerHaptic('light');
-                  onOpenPerformance?.(post.user.username);
+                  onOpenPerformance?.(user.username);
                 }}
                 disabled={!onOpenPerformance}
                 className="w-full py-2.5 px-3 rounded-xl bg-emerald-500/10 hover:bg-emerald-500/20 disabled:opacity-50 text-emerald-300 border border-emerald-500/30 text-xs font-bold flex items-center justify-center gap-1.5 transition-all active:scale-95 cursor-pointer"

@@ -9,6 +9,12 @@
   "theme_color": "#18633c",
   "icons": [
     {
+      "src": "/scrolic-icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
       "src": "/icon-scrolic.svg",
       "sizes": "any",
       "type": "image/svg+xml",

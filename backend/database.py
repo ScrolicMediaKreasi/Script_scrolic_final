@@ -6,6 +6,7 @@ import os, sys, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 
 current_dir = Path(__file__).resolve().parent
 parent_dir = current_dir.parent
@@ -219,6 +220,7 @@ class MemoryStore:
         return None
 
     def create_user(self, user_dict: Dict[str, Any]) -> Dict[str, Any]:
+        username = str(user_dict.get("username") or user_dict.get("display_name") or "trader").strip() or "trader"
         user_dict.setdefault("created_at", datetime.now(timezone.utc))
         user_dict.setdefault("updated_at", datetime.now(timezone.utc))
         user_dict.setdefault("followers_count", 0)
@@ -226,8 +228,10 @@ class MemoryStore:
         user_dict.setdefault("following_list", [])
         user_dict.setdefault("saved_post_ids", [])
         user_dict.setdefault("energy", 0)
+        user_dict.setdefault("withdrawable_energy", 0)
         user_dict.setdefault("win_rate", 0.0)
         user_dict.setdefault("trades_count", 0)
+        user_dict.setdefault("avatar", f"https://api.dicebear.com/7.x/bottts/svg?seed={quote(username, safe='')}")
         user_dict.setdefault("is_verified", False)
         user_dict.setdefault("ctrader_connected", False)
         user_dict.setdefault("ctrader_account_id", None)
@@ -239,6 +243,10 @@ class MemoryStore:
         user_dict.setdefault("email_verified", False)
         user_dict.setdefault("email_verified_at", None)
         user_dict.setdefault("known_login_devices", [])
+        if user_dict.get("referrer_id") and not user_dict.get("referred_by"):
+            user_dict["referred_by"] = user_dict["referrer_id"]
+        if user_dict.get("referred_by") and not user_dict.get("referrer_id"):
+            user_dict["referrer_id"] = user_dict["referred_by"]
 
         if self.is_mongo_connected and self.db is not None:
             try:
@@ -305,18 +313,25 @@ class MemoryStore:
             return u
         return None
 
-    def update_energy(self, identifier: str, delta: int) -> tuple[int, Optional[Dict[str, Any]]]:
+    def update_energy(self, identifier: str, delta: int, bucket: str = "spendable") -> tuple[int, Optional[Dict[str, Any]]]:
         u = self.find_user_by_id_or_username(identifier)
         if u:
-            curr = u.get("energy", 0)
-            new_val = max(0, curr + delta)
-            u["energy"] = new_val
+            bucket_name = "spendable" if str(bucket).lower() not in {"withdrawable", "commission", "withdrawal"} else "withdrawable"
+            current = int(u.get("withdrawable_energy", 0) if bucket_name == "withdrawable" else u.get("energy", 0))
+            new_val = max(0, current + delta)
+
+            if bucket_name == "withdrawable":
+                u["withdrawable_energy"] = new_val
+                set_payload = {"withdrawable_energy": new_val}
+            else:
+                u["energy"] = new_val
+                set_payload = {"energy": new_val}
 
             if self.is_mongo_connected and self.db is not None:
                 try:
                     self.db.users.update_one(
                         {"$or": [{"id": u.get("id")}, {"username": u.get("username")}]},
-                        {"$set": {"energy": new_val}}
+                        {"$set": set_payload}
                     )
                 except Exception as e:
                     logger.warning(f"[MongoDB] update_energy error: {e}")
@@ -629,6 +644,104 @@ class MemoryStore:
                 logger.warning(f"[MongoDB] create_withdrawal error: {e}")
         self.withdrawals.insert(0, doc)
         return doc
+
+    def get_all_users(self) -> List[Dict[str, Any]]:
+        if self.is_mongo_connected and self.db is not None:
+            try:
+                return list(self.db.users.find({}))
+            except Exception as e:
+                logger.warning(f"[MongoDB] get_all_users error: {e}")
+        return self.users
+
+    def get_5_generation_referral_network(self, user_id: str) -> Dict[str, Any]:
+        user = self.find_user_by_id_or_username(user_id)
+        if not user:
+            return {
+                "sponsoredUsersCount": 0,
+                "totalReferrals": 0,
+                "generations": {f"gen{i}": {"count": 0, "users": []} for i in range(1, 6)}
+            }
+
+        uid = user.get("id") or user.get("username")
+        all_users = self.users
+        if self.is_mongo_connected and self.db is not None:
+            try:
+                all_users = list(self.db.users.find({}))
+            except Exception as e:
+                logger.warning(f"[MongoDB] get_5_generation_referral_network error: {e}")
+
+        generations = {f"gen{i}": {"count": 0, "users": []} for i in range(1, 6)}
+        
+        ref_keys = {uid, user.get("username"), user.get("referral_code")}
+        gen1_users = [
+            u for u in all_users 
+            if u.get("referrer_id") in ref_keys or u.get("referred_by") in ref_keys
+        ]
+        generations["gen1"]["users"] = [
+            {"id": u.get("id"), "username": u.get("username"), "displayName": u.get("display_name"), "createdAt": str(u.get("created_at", ""))}
+            for u in gen1_users
+        ]
+        generations["gen1"]["count"] = len(gen1_users)
+
+        gen1_keys = set()
+        for u in gen1_users:
+            if u.get("id"): gen1_keys.add(u["id"])
+            if u.get("username"): gen1_keys.add(u["username"])
+            if u.get("referral_code"): gen1_keys.add(u["referral_code"])
+
+        gen2_users = [u for u in all_users if u.get("referrer_id") in gen1_keys or u.get("referred_by") in gen1_keys] if gen1_keys else []
+        generations["gen2"]["users"] = [
+            {"id": u.get("id"), "username": u.get("username"), "displayName": u.get("display_name"), "createdAt": str(u.get("created_at", ""))}
+            for u in gen2_users
+        ]
+        generations["gen2"]["count"] = len(gen2_users)
+
+        gen2_keys = set()
+        for u in gen2_users:
+            if u.get("id"): gen2_keys.add(u["id"])
+            if u.get("username"): gen2_keys.add(u["username"])
+            if u.get("referral_code"): gen2_keys.add(u["referral_code"])
+
+        gen3_users = [u for u in all_users if u.get("referrer_id") in gen2_keys or u.get("referred_by") in gen2_keys] if gen2_keys else []
+        generations["gen3"]["users"] = [
+            {"id": u.get("id"), "username": u.get("username"), "displayName": u.get("display_name"), "createdAt": str(u.get("created_at", ""))}
+            for u in gen3_users
+        ]
+        generations["gen3"]["count"] = len(gen3_users)
+
+        gen3_keys = set()
+        for u in gen3_users:
+            if u.get("id"): gen3_keys.add(u["id"])
+            if u.get("username"): gen3_keys.add(u["username"])
+            if u.get("referral_code"): gen3_keys.add(u["referral_code"])
+
+        gen4_users = [u for u in all_users if u.get("referrer_id") in gen3_keys or u.get("referred_by") in gen3_keys] if gen3_keys else []
+        generations["gen4"]["users"] = [
+            {"id": u.get("id"), "username": u.get("username"), "displayName": u.get("display_name"), "createdAt": str(u.get("created_at", ""))}
+            for u in gen4_users
+        ]
+        generations["gen4"]["count"] = len(gen4_users)
+
+        gen4_keys = set()
+        for u in gen4_users:
+            if u.get("id"): gen4_keys.add(u["id"])
+            if u.get("username"): gen4_keys.add(u["username"])
+            if u.get("referral_code"): gen4_keys.add(u["referral_code"])
+
+        gen5_users = [u for u in all_users if u.get("referrer_id") in gen4_keys or u.get("referred_by") in gen4_keys] if gen4_keys else []
+        generations["gen5"]["users"] = [
+            {"id": u.get("id"), "username": u.get("username"), "displayName": u.get("display_name"), "createdAt": str(u.get("created_at", ""))}
+            for u in gen5_users
+        ]
+        generations["gen5"]["count"] = len(gen5_users)
+
+        total_referrals = len(gen1_users) + len(gen2_users) + len(gen3_users) + len(gen4_users) + len(gen5_users)
+
+        return {
+            "sponsoredUsersCount": len(gen1_users),
+            "totalReferrals": total_referrals,
+            "generations": generations
+        }
 
 db_store = MemoryStore()
 

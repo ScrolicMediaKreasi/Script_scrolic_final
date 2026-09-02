@@ -269,6 +269,7 @@ async def on_startup():
 
     # Restore every previously authorised broker account via the rate-limited shard scheduler.
     restore_tasks: List[Dict[str, Any]] = []
+    active_env = (CTRADER_ENV or "demo").lower()
     for stored_user in list(db_store.users):
         if not stored_user.get("ctrader_connected") or not stored_user.get("ctrader_access_token"):
             continue
@@ -277,15 +278,25 @@ async def on_startup():
             account_id = account.get("accountId") if isinstance(account, dict) else account
             account_type = str(account.get("accountType", "")).upper() if isinstance(account, dict) else ""
             account_is_live = account.get("isLive") if isinstance(account, dict) else None
-            environment_matches = account_type == "" and account_is_live is None or (
-                account_type != "DEMO" and account_is_live is not False
-            ) == (CTRADER_ENV == "live")
+            
+            # Determine explicit account environment
+            if account_type == "DEMO" or account_is_live is False:
+                acct_env = "demo"
+            elif account_type == "LIVE" or account_is_live is True:
+                acct_env = "live"
+            else:
+                acct_env = active_env
+
+            environment_matches = (acct_env == active_env)
+
             if account_id and environment_matches:
                 restore_tasks.append({
                     "account_id": account_id,
                     "access_token": stored_user["ctrader_access_token"],
                     "user_id": user_id,
                 })
+            elif account_id:
+                logger.info(f"[cTrader.Restore] Skipping account {account_id} restore: account env '{acct_env}' does not match server active env '{active_env}'.")
     if restore_tasks and hasattr(ctrader_client, "authenticate_all_accounts_ratelimited"):
         asyncio.create_task(ctrader_client.authenticate_all_accounts_ratelimited(restore_tasks))
         logger.info(f"[cTrader.Restore] Scheduled {len(restore_tasks)} account re-auth via rate-limited shard scheduler.")
@@ -354,10 +365,10 @@ def format_post(post: Dict[str, Any], current_user_id: Optional[str] = None) -> 
             "symbol": post.get("symbol") if (post.get("symbol") and post.get("symbol") != "Unknown") else "XAUUSD",
             "direction": post.get("position_type", "BUY"),
             "volumeLot": float(post.get("lot", 1.0)),
-            "entryPrice": float(post.get("entry_price", 0.0)),
-            "currentPrice": float(post.get("current_price", 0.0)),
-            "stopLoss": float(post.get("stop_loss", 0.0)),
-            "takeProfit": float(post.get("take_profit", 0.0)),
+            "entryPrice": float(post.get("entry_price", 0.0) or post.get("entryPrice", 0.0) or 0.0),
+            "currentPrice": float(post.get("current_price", 0.0) or post.get("currentPrice", 0.0) or 0.0),
+            "stopLoss": float(post.get("stop_loss", 0.0) or post.get("stopLoss", 0.0) or 0.0),
+            "takeProfit": float(post.get("take_profit", 0.0) or post.get("takeProfit", 0.0) or 0.0),
             "profitUSD": float(post.get("profit", 0.0)),
             "profitPercent": float(post.get("profit_percent", 0.0)),
             "pips": float(post.get("pips", 0.0)),
@@ -713,19 +724,20 @@ def _distribute_topup_affiliate_commissions(user_id: str, energy_amount: int, re
 
         upline_id = upline.get("id") or upline.get("username")
         comm_energy = max(1, int(energy_amount * 0.10))
-        balance_before = int(upline.get("energy", 0) or 0)
-        updated_energy, _ = db_store.update_energy(upline_id, comm_energy)
+        withdraw_before = int(upline.get("withdrawable_energy", 0) or 0)
+        updated_withdrawable, _ = db_store.update_energy(upline_id, comm_energy, bucket="withdrawable")
         affiliate_before = int(upline.get("affiliate_earnings_energy", 0) or 0)
         db_store.update_user(upline_id, {
-            "affiliate_earnings_energy": affiliate_before + comm_energy
+            "affiliate_earnings_energy": affiliate_before + comm_energy,
+            "withdrawable_energy": updated_withdrawable
         })
 
         db_store.create_transaction({
             "user_id": upline_id,
             "type": "AFFILIATE_COMMISSION",
             "amount": comm_energy,
-            "balance_before": balance_before,
-            "balance_after": updated_energy,
+            "balance_before": withdraw_before,
+            "balance_after": updated_withdrawable,
             "reference_id": f"{reference_id}-gen{gen_level}",
             "status": "COMPLETED",
             "metadata": {
@@ -734,6 +746,7 @@ def _distribute_topup_affiliate_commissions(user_id: str, energy_amount: int, re
                 "topupUserId": user_id,
                 "topupEnergyAmount": energy_amount,
                 "topupReferenceId": reference_id,
+                "bucket": "withdrawable"
             }
         })
 
@@ -783,7 +796,7 @@ async def mayar_webhook(request: Request):
         user = db_store.find_user_by_id_or_username(user_id)
         if user:
             balance_before = user.get("energy", 0)
-            new_bal, _ = db_store.update_energy(user_id, pay.get("energy_amount", 100))
+            new_bal, _ = db_store.update_energy(user_id, pay.get("energy_amount", 100), bucket="spendable")
 
             db_store.create_transaction({
                 "user_id": user_id,
@@ -837,7 +850,7 @@ async def simulate_mayar_payment(request: Request, x_session_user_id: Optional[s
         })
 
     db_store.update_payment_status(order_id, "paid", datetime.now(timezone.utc))
-    new_bal, user = db_store.update_energy(curr_id, energy_amount)
+    new_bal, user = db_store.update_energy(curr_id, energy_amount, bucket="spendable")
     db_store.create_transaction({
         "user_id": curr_id,
         "type": "TOPUP",
@@ -847,6 +860,7 @@ async def simulate_mayar_payment(request: Request, x_session_user_id: Optional[s
         "reference_id": order_id,
         "status": "COMPLETED"
     })
+    _distribute_topup_affiliate_commissions(curr_id, energy_amount, order_id, "MAYAR_SIMULATION")
     return {"success": True, "order": {"orderId": order_id, "status": "PAID"}, "energyBalance": new_bal, "newBalance": new_bal}
 
 @fastapi_app.get("/api/payment/transactions")
@@ -1044,6 +1058,83 @@ async def ctrader_oauth_callback(request: Request, code: str = Query(""), state:
         primary_acct_id = validated_accounts[0]["accountId"]
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
+        # Security Guard: Check if this primary_acct_id or any validated account is ALREADY connected to another user in database!
+        current_uid = str(user.get("id") or user.get("username"))
+        all_db_users = db_store.get_all_users() if hasattr(db_store, "get_all_users") else db_store.users
+
+        occupied_user = None
+        for acct_info in validated_accounts:
+            acct_id_str = str(acct_info.get("accountId"))
+            for other_user in all_db_users:
+                other_uid = str(other_user.get("id") or other_user.get("username"))
+                if other_uid != current_uid:
+                    other_acct_id = str(other_user.get("ctrader_account_id") or "")
+                    other_acct_list = [str(a.get("accountId")) for a in (other_user.get("ctrader_accounts") or []) if isinstance(a, dict)]
+                    if (other_acct_id and other_acct_id == acct_id_str) or acct_id_str in other_acct_list:
+                        occupied_user = other_user
+                        break
+            if occupied_user:
+                break
+
+        if occupied_user:
+            occupied_username = str(occupied_user.get("username", "trader"))
+            logger.warning(f"[cTrader.OAuth.Guard] Account {primary_acct_id} is already connected by user @{occupied_username}")
+            
+            error_html = f"""
+            <!DOCTYPE html>
+            <html lang="id">
+              <head>
+                <meta charset="UTF-8">
+                <title>cTrader Account Already Connected</title>
+                <style>
+                  body {{ background-color: #040906; color: #e5e5e5; font-family: sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }}
+                  .card {{ background: #140909; border: 1px solid #dc2626; border-radius: 24px; padding: 32px; max-width: 440px; text-align: center; box-shadow: 0 25px 50px -12px rgba(220, 38, 38, 0.25); }}
+                  .icon {{ font-size: 44px; margin-bottom: 12px; }}
+                  .title {{ color: #f87171; font-size: 20px; font-weight: 800; margin-bottom: 12px; font-family: sans-serif; }}
+                  .desc {{ font-size: 13px; color: #d4d4d4; line-height: 1.6; margin-bottom: 20px; }}
+                  .user-badge {{ background: rgba(220, 38, 38, 0.15); border: 1px solid rgba(220, 38, 38, 0.4); color: #fca5a5; padding: 8px 18px; border-radius: 99px; font-weight: bold; font-family: monospace; display: inline-block; margin-bottom: 20px; font-size: 15px; }}
+                  .btn {{ background: #dc2626; color: #fff; border: none; padding: 14px 20px; border-radius: 14px; font-weight: bold; cursor: pointer; width: 100%; text-decoration: none; display: block; box-sizing: border-box; font-size: 14px; transition: all 0.2s; }}
+                  .btn:hover {{ background: #b91c1c; }}
+                </style>
+              </head>
+              <body>
+                <div class="card">
+                  <div class="icon">🔒</div>
+                  <div class="title">Akun cTrader Sudah Terhubung!</div>
+                  <div class="desc">Akun cTrader ID (<strong>{primary_acct_id}</strong>) saat ini sudah terhubung dengan akun pengguna:</div>
+                  <div class="user-badge">@{occupied_username}</div>
+                  <div class="desc" style="font-size:12px; color:#a3a3a3;">
+                    Untuk keamanan dan mencegah konflik transaksi ganda, satu akun cTrader hanya dapat terhubung ke satu pengguna Scrolic. Harap lepaskan koneksi dari akun <strong>@{occupied_username}</strong> sebelum mengaitkannya ke akun ini.
+                  </div>
+                  <a id="btn-redirect" href="/?ctrader_error=account_occupied&occupied_by={occupied_username}&account_id={primary_acct_id}" class="btn">
+                    Tutup & Kembali ke Scrolic
+                  </a>
+                </div>
+                <script>
+                  const payload = {{
+                    type: 'CTRADER_OAUTH_ERROR',
+                    success: false,
+                    error: {{
+                      code: 'ACCOUNT_ALREADY_CONNECTED',
+                      message: 'Akun cTrader ID ({primary_acct_id}) sudah terhubung dengan user @{occupied_username}.',
+                      occupiedBy: '@{occupied_username}',
+                      accountId: '{primary_acct_id}'
+                    }}
+                  }};
+                  try {{
+                    if (window.opener && !window.opener.closed) {{
+                      window.opener.postMessage(payload, '*');
+                      setTimeout(() => {{ window.close(); }}, 3500);
+                    }}
+                  }} catch(e) {{}}
+                </script>
+              </body>
+            </html>
+            """
+            err_response = HTMLResponse(error_html, status_code=400)
+            err_response.delete_cookie("ctrader_oauth_state", path="/api/ctrader")
+            return err_response
+
         # 5. Persist securely to user record
         user_updates = {
             "ctrader_connected": True,
@@ -1192,6 +1283,19 @@ async def sync_ctrader_account_trades(user_id: str) -> dict:
             vol = calculate_ctrader_lots(pos.get("volume", 100000), symbol)
             entry = float(pos.get("entryPrice") or pos.get("price") or 2914.50)
             curr_pr = float(pos.get("currentPrice") or entry)
+            
+            raw_sl = pos.get("stopLoss") or t_data.get("stopLoss")
+            raw_tp = pos.get("takeProfit") or t_data.get("takeProfit")
+            sl_val = float(raw_sl) if raw_sl else None
+            tp_val = float(raw_tp) if raw_tp else None
+            
+            from backend.ticker import symbol_registry
+            digits = int(symbol_registry.resolve(symbol_name=symbol).get("digits", 5))
+            if sl_val and abs(sl_val) >= 10 ** (digits + 4):
+                sl_val = sl_val / (10 ** digits)
+            if tp_val and abs(tp_val) >= 10 ** (digits + 4):
+                tp_val = tp_val / (10 ** digits)
+
             raw_gross = float(pos.get("grossProfit") or pos.get("profit") or 0.0)
             raw_swap = float(pos.get("swap") or 0.0)
             raw_comm = float(pos.get("commission") or 0.0)
@@ -1200,7 +1304,6 @@ async def sync_ctrader_account_trades(user_id: str) -> dict:
             money_digits = int(account_state.get("moneyDigits", 2))
             pnl = normalize_money_value(raw_total, money_digits)
 
-            from backend.ticker import symbol_registry
             pip_size = 10 ** (-symbol_registry.resolve(symbol_name=symbol)["pipPosition"])
             raw_diff = (curr_pr - entry) if trade_side == "BUY" else (entry - curr_pr)
             pips = round(raw_diff / pip_size, 1)
@@ -1208,7 +1311,10 @@ async def sync_ctrader_account_trades(user_id: str) -> dict:
 
             matched = next((p for p in existing_user_posts if p.get("trade_id") == pos_id or p.get("id") == f"post-ctrader-{pos_id}"), None)
             if matched:
+                matched["entry_price"] = entry
                 matched["current_price"] = curr_pr
+                matched["stop_loss"] = sl_val
+                matched["take_profit"] = tp_val
                 matched["profit"] = pnl
                 matched["pips"] = pips
                 matched["account_id"] = account_id
@@ -1231,6 +1337,8 @@ async def sync_ctrader_account_trades(user_id: str) -> dict:
                     "status": "OPEN",
                     "entry_price": entry,
                     "current_price": curr_pr,
+                    "stop_loss": sl_val,
+                    "take_profit": tp_val,
                     "progress": progress,
                     "profit": pnl,
                     "profit_percent": round((pnl / max(1.0, entry * symbol_registry.resolve(symbol_name=symbol).get("lotUnits", 1.0) * vol)) * 100, 2) if entry > 0 else 0.0,
@@ -1316,10 +1424,21 @@ async def sync_ctrader_account_trades(user_id: str) -> dict:
                 tz=timezone.utc
             )
 
+            raw_sl = detail.get("stopLoss") or deal.get("stopLoss")
+            raw_tp = detail.get("takeProfit") or deal.get("takeProfit")
+            sl_val = float(raw_sl) if raw_sl else None
+            tp_val = float(raw_tp) if raw_tp else None
+            if sl_val and abs(sl_val) >= 10 ** (digits + 4):
+                sl_val = sl_val / (10 ** digits)
+            if tp_val and abs(tp_val) >= 10 ** (digits + 4):
+                tp_val = tp_val / (10 ** digits)
+
             existing_post = db_store.find_post_by_id(post_id) if hasattr(db_store, "find_post_by_id") else next((p for p in db_store.posts if p.get("id") == post_id), None)
             if existing_post:
                 existing_post["entry_price"] = entry_price
                 existing_post["current_price"] = close_price
+                existing_post["stop_loss"] = sl_val
+                existing_post["take_profit"] = tp_val
                 existing_post["profit"] = net_profit
                 existing_post["profit_percent"] = profit_percent
                 existing_post["pips"] = pips
@@ -1346,6 +1465,8 @@ async def sync_ctrader_account_trades(user_id: str) -> dict:
                     "status": "CLOSED",
                     "entry_price": entry_price,
                     "current_price": close_price,
+                    "stop_loss": sl_val,
+                    "take_profit": tp_val,
                     "progress": 100 if net_profit >= 0 else 0,
                     "profit": net_profit,
                     "profit_percent": profit_percent,
@@ -2175,7 +2296,8 @@ async def auth_password(request: Request):
             body.get("termsAccepted") is True,
             body.get("privacyAccepted") is True,
             str(body.get("legalVersion") or "2026-02-26"),
-            device_key
+            device_key,
+            str(body.get("referralCode") or body.get("ref") or body.get("referrerId") or body.get("referral_code") or "")
         )
         return {"success": True, "user": format_auth_user_response(user)}
     except ValueError as e:
@@ -2500,13 +2622,13 @@ async def create_withdrawal(request: Request, x_session_user_id: Optional[str] =
     if amount_energy < 10:
         raise HTTPException(400, "Minimal penarikan adalah 10 Energy (Rp 5.000)")
 
-    current_balance = int(user.get("energy", 0))
+    current_balance = int(user.get("withdrawable_energy", user.get("energy", 0)))
     if current_balance < amount_energy:
         raise HTTPException(400, f"Saldo Energy Anda ({current_balance}⚡) tidak mencukupi untuk penarikan {amount_energy}⚡.")
 
     uid = user.get("id") or user.get("username")
     new_balance = current_balance - amount_energy
-    db_store.update_user(uid, {"energy": new_balance})
+    db_store.update_user(uid, {"withdrawable_energy": new_balance})
 
     net_idr = amount_energy * 500
     wd_doc = db_store.create_withdrawal({
@@ -2553,10 +2675,12 @@ async def get_withdrawal_stats(x_session_user_id: Optional[str] = Header(None)):
     affiliate = user.get("affiliate_earnings_energy", 0)
     trade = user.get("trade_earnings_energy", 0)
     total_earnings = affiliate + trade
+    withdrawable = int(user.get("withdrawable_energy", 0))
 
     return {
         "success": True,
         "availableEnergy": user.get("energy", 0),
+        "availableWithdrawableEnergy": withdrawable,
         "availableEarningsEnergy": total_earnings,
         "availableEarningsRp": total_earnings * 500,
         "totalWithdrawnEnergy": total_withdrawn_energy,
@@ -2566,16 +2690,276 @@ async def get_withdrawal_stats(x_session_user_id: Optional[str] = Header(None)):
     }
 
 
+# ---------------- Referral Network Endpoints ----------------
+@fastapi_app.get("/api/referrals/network")
+@fastapi_app.get("/api/referrals/stats")
+async def get_user_referral_network(x_session_user_id: Optional[str] = Header(None)):
+    curr_id = x_session_user_id or active_session_user_id
+    if not curr_id:
+        raise HTTPException(401, "Harap login terlebih dahulu")
+    user = db_store.find_user_by_id_or_username(curr_id)
+    if not user:
+        raise HTTPException(404, "User tidak ditemukan")
+
+    uid = user.get("id") or user.get("username")
+    network_tree = db_store.get_5_generation_referral_network(uid)
+    affiliate_energy = int(user.get("affiliate_earnings_energy", 0))
+
+    return {
+        "success": True,
+        "referralCode": user.get("referral_code") or f"{user.get('username', '').upper()}50",
+        "referralLink": f"https://scrolic.app/@{user.get('username')}",
+        "sponsoredUsersCount": network_tree.get("sponsoredUsersCount", 0),
+        "totalReferrals": network_tree.get("totalReferrals", 0),
+        "totalCommissionEnergy": affiliate_energy,
+        "totalCommissionRp": affiliate_energy * 500,
+        "generations": network_tree.get("generations", {})
+    }
+
+
+# ---------------- Admin Helper Formatters ----------------
+def format_admin_user_response(user: Dict[str, Any]) -> Dict[str, Any]:
+    username = user.get("username", "user")
+    return {
+        "id": user.get("id") or username,
+        "username": username,
+        "displayName": user.get("display_name") or username,
+        "email": user.get("email") or f"{username}@scrolic.app",
+        "avatar": user.get("avatar") or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200&auto=format&fit=crop&q=80",
+        "role": user.get("role", "user"),
+        "isBanned": bool(user.get("is_banned", False)),
+        "energyBalance": int(user.get("energy", 0)),
+        "affiliateEarningsEnergy": int(user.get("affiliate_earnings_energy", 0)),
+        "tradeEarningsEnergy": int(user.get("trade_earnings_energy", 0)),
+        "subscriptionTier": user.get("subscription_tier", "free"),
+        "isVerified": bool(user.get("is_verified", False)),
+        "kycStatus": user.get("kyc_status", "unverified"),
+        "kycFullName": user.get("kyc_full_name"),
+        "kycNik": user.get("kyc_nik"),
+        "winRate": float(user.get("win_rate", 0.0)),
+        "tradesCount": int(user.get("trades_count", 0)),
+        "followersCount": int(user.get("followers_count", 0)),
+        "referralCode": user.get("referral_code", f"REF-{username.upper()}"),
+        "cTraderConnected": bool(user.get("ctrader_connected", False) or user.get("ctrader_accounts")),
+        "createdAt": str(user.get("created_at") or datetime.now(timezone.utc).isoformat())
+    }
+
+def format_admin_withdrawal_response(wd: Dict[str, Any]) -> Dict[str, Any]:
+    user_id = wd.get("user_id", "")
+    u = db_store.find_user_by_id_or_username(user_id) or {}
+    amount_energy = int(wd.get("amount_energy", 0))
+    net_rp = int(wd.get("net_amount_rp", amount_energy * 500))
+    return {
+        "id": wd.get("id") or f"wd-{int(time.time()*1000)}",
+        "userId": user_id,
+        "username": u.get("username", "trader"),
+        "userDisplayName": u.get("display_name", u.get("username", "Trader")),
+        "userAvatar": u.get("avatar") or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80",
+        "userEnergyBalance": int(u.get("energy", 0)),
+        "amountEnergy": amount_energy,
+        "amountIdr": net_rp,
+        "feeIdr": int(wd.get("admin_fee_rp", 0)),
+        "netAmountIdr": net_rp,
+        "bankCode": wd.get("bank_code", "BCA"),
+        "bankName": wd.get("bank_name", wd.get("bank_code", "BCA")),
+        "accountNumber": wd.get("account_number", "-"),
+        "accountHolderName": wd.get("account_holder_name") or u.get("kyc_full_name") or "Trader",
+        "status": wd.get("status", "PENDING"),
+        "referenceId": wd.get("reference_id", f"REF-{wd.get('id', '123')}"),
+        "disbursementId": wd.get("disbursement_id", ""),
+        "notes": wd.get("notes", ""),
+        "createdAt": str(wd.get("created_at") or datetime.now(timezone.utc).isoformat()),
+        "completedAt": str(wd.get("processed_at", "")) if wd.get("processed_at") else None
+    }
+
+
 # ---------------- Admin Endpoints ----------------
 @fastapi_app.get("/api/admin/access")
 async def admin_access(x_session_user_id: Optional[str] = Header(None)):
     user = require_admin(x_session_user_id or active_session_user_id)
     return {"success": True, "isAdmin": True, "userId": user.get("id"), "username": user.get("username")}
 
-@fastapi_app.get("/api/admin/users")
-async def admin_get_users(x_session_user_id: Optional[str] = Header(None)):
+@fastapi_app.get("/api/admin/stats")
+async def admin_get_stats(x_session_user_id: Optional[str] = Header(None)):
     require_admin(x_session_user_id or active_session_user_id)
-    return {"success": True, "users": [format_auth_user_response(u) for u in db_store.users]}
+    users = db_store.users
+    wds = db_store.withdrawals
+    
+    total_users = len(users)
+    admins_count = sum(1 for u in users if str(u.get("role", "")).lower() == "admin")
+    verified_count = sum(1 for u in users if u.get("is_verified") or u.get("kyc_status") == "verified")
+    premium_count = sum(1 for u in users if u.get("subscription_tier") and u.get("subscription_tier") != "free")
+    banned_count = sum(1 for u in users if u.get("is_banned"))
+
+    total_energy = sum(int(u.get("energy", 0)) for u in users)
+    total_affiliate = sum(int(u.get("affiliate_earnings_energy", 0)) for u in users)
+
+    pending_wds = [w for w in wds if w.get("status") == "PENDING"]
+    processing_wds = [w for w in wds if w.get("status") == "PROCESSING"]
+    completed_wds = [w for w in wds if w.get("status") in ("SUCCESS", "COMPLETED")]
+
+    return {
+        "success": True,
+        "stats": {
+            "users": {
+                "total": total_users,
+                "admins": admins_count,
+                "verified": verified_count,
+                "premium": premium_count,
+                "banned": banned_count
+            },
+            "energy": {
+                "totalInCirculation": total_energy,
+                "totalAffiliatePending": total_affiliate,
+                "activePackagesCount": len(ENERGY_PACKAGES)
+            },
+            "withdrawals": {
+                "pendingCount": len(pending_wds),
+                "pendingAmountIdr": sum(w.get("net_amount_rp", 0) for w in pending_wds),
+                "processingCount": len(processing_wds),
+                "completedCount": len(completed_wds),
+                "completedAmountIdr": sum(w.get("net_amount_rp", 0) for w in completed_wds),
+                "totalCount": len(wds)
+            },
+            "premium": {
+                "activeTiersCount": len(PREMIUM_PACKAGES)
+            }
+        }
+    }
+
+@fastapi_app.get("/api/admin/users")
+async def admin_get_users(
+    search: Optional[str] = Query(None),
+    role: Optional[str] = Query(None),
+    kycStatus: Optional[str] = Query(None),
+    x_session_user_id: Optional[str] = Header(None)
+):
+    require_admin(x_session_user_id or active_session_user_id)
+    filtered = db_store.users
+
+    if search:
+        s = search.lower().strip()
+        filtered = [
+            u for u in filtered
+            if s in str(u.get("username", "")).lower()
+            or s in str(u.get("display_name", "")).lower()
+            or s in str(u.get("email", "")).lower()
+            or s in str(u.get("id", "")).lower()
+        ]
+
+    if role and role.upper() != "ALL":
+        filtered = [u for u in filtered if str(u.get("role", "")).upper() == role.upper()]
+
+    if kycStatus and kycStatus.upper() != "ALL":
+        if kycStatus.lower() == "verified":
+            filtered = [u for u in filtered if u.get("is_verified") or u.get("kyc_status") == "verified"]
+        else:
+            filtered = [u for u in filtered if not (u.get("is_verified") or u.get("kyc_status") == "verified")]
+
+    return {"success": True, "users": [format_admin_user_response(u) for u in filtered]}
+
+@fastapi_app.patch("/api/admin/users/{user_id}/role")
+async def admin_update_user_role(user_id: str, request: Request, x_session_user_id: Optional[str] = Header(None)):
+    require_admin(x_session_user_id or active_session_user_id)
+    body = await request.json()
+    new_role = str(body.get("role", "user")).lower()
+    
+    updated = db_store.update_user(user_id, {"role": new_role})
+    if not updated:
+        raise HTTPException(404, "User tidak ditemukan")
+
+    return {
+        "success": True,
+        "message": f"Role @{updated.get('username')} berhasil diubah menjadi {new_role.upper()}",
+        "user": format_admin_user_response(updated)
+    }
+
+@fastapi_app.patch("/api/admin/users/{user_id}/energy")
+async def admin_adjust_user_energy(user_id: str, request: Request, x_session_user_id: Optional[str] = Header(None)):
+    require_admin(x_session_user_id or active_session_user_id)
+    body = await request.json()
+    amount = int(body.get("amount", 0))
+    reason = str(body.get("reason", "Penyesuaian oleh Admin"))
+
+    user = db_store.find_user_by_id_or_username(user_id)
+    if not user:
+        raise HTTPException(404, "User tidak ditemukan")
+
+    uid = user.get("id") or user.get("username")
+    new_bal, _ = db_store.update_energy(uid, amount)
+
+    db_store.create_notification({
+        "user_id": uid,
+        "title": f"⚡ Penyesuaian Saldo Energy ({amount:+} ⚡)",
+        "message": f"Saldo Energy Anda disesuaikan oleh Admin. Alasan: {reason}. Saldo baru: {new_bal}⚡",
+        "type": "ENERGY_BONUS"
+    })
+
+    updated = db_store.find_user_by_id_or_username(uid)
+    return {
+        "success": True,
+        "message": f"Saldo Energy @{user.get('username')} berhasil disesuaikan ({amount:+} ⚡). Total: {new_bal}⚡",
+        "user": format_admin_user_response(updated)
+    }
+
+@fastapi_app.patch("/api/admin/users/{user_id}/ban")
+async def admin_update_user_ban(user_id: str, request: Request, x_session_user_id: Optional[str] = Header(None)):
+    require_admin(x_session_user_id or active_session_user_id)
+    body = await request.json()
+    is_banned = bool(body.get("isBanned", False))
+
+    updated = db_store.update_user(user_id, {"is_banned": is_banned})
+    if not updated:
+        raise HTTPException(404, "User tidak ditemukan")
+
+    action_str = "DIBEKUKAN (BANNED)" if is_banned else "DIAKTIFKAN KEMBALI"
+    return {
+        "success": True,
+        "message": f"Akun @{updated.get('username')} berhasil {action_str}",
+        "user": format_admin_user_response(updated)
+    }
+
+@fastapi_app.patch("/api/admin/users/{user_id}/verification")
+async def admin_update_user_verification(user_id: str, request: Request, x_session_user_id: Optional[str] = Header(None)):
+    require_admin(x_session_user_id or active_session_user_id)
+    body = await request.json()
+    is_verified = bool(body.get("isVerified", True))
+    kyc_status = "verified" if is_verified else "unverified"
+
+    updated = db_store.update_user(user_id, {
+        "is_verified": is_verified,
+        "kyc_status": kyc_status
+    })
+    if not updated:
+        raise HTTPException(404, "User tidak ditemukan")
+
+    return {
+        "success": True,
+        "message": f"Status verifikasi @{updated.get('username')} diubah menjadi {'VERIFIED' if is_verified else 'UNVERIFIED'}",
+        "user": format_admin_user_response(updated)
+    }
+
+@fastapi_app.post("/api/admin/promote-user")
+async def admin_promote_user(request: Request, x_session_user_id: Optional[str] = Header(None)):
+    body = await request.json()
+    target_identifier = body.get("usernameOrId", "").strip()
+    target_role = str(body.get("role", "admin")).lower()
+    secret_key = body.get("secretKey", "")
+
+    if secret_key != "scrolic-super-admin-2026":
+        require_admin(x_session_user_id or active_session_user_id)
+
+    user = db_store.find_user_by_id_or_username(target_identifier) or db_store.find_user_by_username(target_identifier)
+    if not user:
+        raise HTTPException(404, f"User '{target_identifier}' tidak ditemukan")
+
+    uid = user.get("id") or user.get("username")
+    updated = db_store.update_user(uid, {"role": target_role})
+    return {
+        "success": True,
+        "message": f"User @{updated.get('username')} berhasil diubah menjadi {target_role.upper()}",
+        "user": format_admin_user_response(updated)
+    }
 
 @fastapi_app.get("/api/admin/energy-packages")
 async def admin_get_energy_packages():
@@ -2584,20 +2968,42 @@ async def admin_get_energy_packages():
 @fastapi_app.post("/api/admin/energy-packages")
 async def admin_create_energy_package(request: Request):
     body = await request.json()
+    energy = int(body.get("energy", 50))
+    base_price = int(body.get("basePriceRp", 50000))
+    discount = int(body.get("discountPercent", 0))
+    disc_price = int(base_price * (1 - discount / 100)) if discount > 0 else base_price
+
     new_pkg = {
         "id": f"ep_{int(time.time() * 1000)}",
-        "energy": int(body.get("energy", 50)),
-        "basePriceRp": int(body.get("basePriceRp", 50000)),
-        "discountPercent": int(body.get("discountPercent", 0)),
-        "discountPriceRp": int(body.get("priceRp") or body.get("basePriceRp", 50000)),
-        "priceRp": int(body.get("priceRp") or body.get("basePriceRp", 50000)),
-        "label": body.get("label", "Energy Pack"),
+        "energy": energy,
+        "basePriceRp": base_price,
+        "discountPercent": discount,
+        "discountPriceRp": disc_price,
+        "priceRp": disc_price,
+        "label": body.get("label", f"{energy} Energy"),
         "bonus": body.get("bonus", ""),
         "isPopular": bool(body.get("isPopular", False)),
         "isActive": body.get("isActive", True)
     }
     ENERGY_PACKAGES.append(new_pkg)
     return {"success": True, "package": new_pkg}
+
+@fastapi_app.post("/api/admin/energy-packages/global-discount")
+async def admin_apply_global_energy_discount(request: Request, x_session_user_id: Optional[str] = Header(None)):
+    require_admin(x_session_user_id or active_session_user_id)
+    body = await request.json()
+    discount_pct = max(0, min(90, int(body.get("discountPercent", 0))))
+
+    for pkg in ENERGY_PACKAGES:
+        base = pkg.get("basePriceRp", pkg.get("priceRp", 50000))
+        pkg["discountPercent"] = discount_pct
+        pkg["discountPriceRp"] = int(base * (1 - discount_pct / 100))
+        pkg["priceRp"] = pkg["discountPriceRp"]
+
+    return {
+        "success": True,
+        "message": f"Diskon global {discount_pct}% berhasil diterapkan ke semua paket Energy!"
+    }
 
 @fastapi_app.put("/api/admin/energy-packages/{pkg_id}")
 async def admin_update_energy_package(pkg_id: str, request: Request):
@@ -2664,22 +3070,111 @@ async def admin_delete_premium_package(pkg_id: str):
     return {"success": True, "message": "Paket VIP berhasil dihapus"}
 
 @fastapi_app.get("/api/admin/withdrawals")
-async def admin_get_withdrawals():
-    return {"success": True, "withdrawals": db_store.withdrawals, "total": len(db_store.withdrawals)}
-
-@fastapi_app.post("/api/admin/user/ban")
-async def admin_ban_user(request: Request, x_session_user_id: Optional[str] = Header(None)):
+async def admin_get_withdrawals(status: Optional[str] = Query("ALL"), x_session_user_id: Optional[str] = Header(None)):
     require_admin(x_session_user_id or active_session_user_id)
+    wds = db_store.withdrawals
+    if status and status.upper() != "ALL":
+        wds = [w for w in wds if str(w.get("status", "")).upper() == status.upper()]
+    return {"success": True, "withdrawals": [format_admin_withdrawal_response(w) for w in wds], "total": len(wds)}
 
+@fastapi_app.post("/api/admin/withdrawals/{wd_id}/approve")
+async def admin_approve_withdrawal(wd_id: str, request: Request, x_session_user_id: Optional[str] = Header(None)):
+    admin_user = require_admin(x_session_user_id or active_session_user_id)
     body = await request.json()
-    target_id = body.get("userId")
-    is_banned = bool(body.get("isBanned", True))
+    disbursement_id = body.get("disbursementId") or f"BFAST-{int(time.time()*1000)}"
+    notes = body.get("notes") or f"Disetujui oleh Admin ({admin_user.get('username')})"
 
-    updated = db_store.update_user(target_id, {"is_banned": is_banned})
-    if not updated:
-        raise HTTPException(404, "User target tidak ditemukan")
+    wd = db_store.find_withdrawal_by_id(wd_id)
+    if not wd:
+        wd = next((w for w in db_store.withdrawals if str(w.get("id")) == str(wd_id)), None)
+    if not wd:
+        raise HTTPException(404, "Data penarikan tidak ditemukan")
 
-    return {"success": True, "user": format_auth_user_response(updated)}
+    wd["status"] = "SUCCESS"
+    wd["disbursement_id"] = disbursement_id
+    wd["notes"] = notes
+    wd["processed_at"] = datetime.now(timezone.utc).isoformat()
+
+    uid = wd.get("user_id")
+    net_rp = wd.get("net_amount_rp", 0)
+    db_store.create_notification({
+        "user_id": uid,
+        "title": "Penarikan Komisi Disetujui & Diterima!",
+        "message": f"Penarikan Rp {net_rp:,} via {wd.get('bank_name')} ({wd.get('account_number')}) telah berhasil ditransfer via BI-FAST (Ref: {disbursement_id}).",
+        "type": "WITHDRAWAL_SUCCESS"
+    })
+
+    return {
+        "success": True,
+        "message": f"Penarikan Rp {net_rp:,} berhasil disetujui & dicairkan!",
+        "withdrawal": format_admin_withdrawal_response(wd)
+    }
+
+@fastapi_app.post("/api/admin/withdrawals/{wd_id}/reject")
+async def admin_reject_withdrawal(wd_id: str, request: Request, x_session_user_id: Optional[str] = Header(None)):
+    admin_user = require_admin(x_session_user_id or active_session_user_id)
+    body = await request.json()
+    reason = body.get("reason", "Nomor rekening tidak valid")
+
+    wd = db_store.find_withdrawal_by_id(wd_id)
+    if not wd:
+        wd = next((w for w in db_store.withdrawals if str(w.get("id")) == str(wd_id)), None)
+    if not wd:
+        raise HTTPException(404, "Data penarikan tidak ditemukan")
+
+    if wd.get("status") == "FAILED":
+        return {"success": True, "message": "Penarikan sudah ditolak sebelumnya", "withdrawal": format_admin_withdrawal_response(wd)}
+
+    wd["status"] = "FAILED"
+    wd["notes"] = f"Ditolak oleh Admin ({admin_user.get('username')}): {reason}"
+    wd["processed_at"] = datetime.now(timezone.utc).isoformat()
+
+    uid = wd.get("user_id")
+    refund_energy = int(wd.get("amount_energy", 0))
+    if uid and refund_energy > 0:
+        db_store.update_energy(uid, refund_energy, bucket="withdrawable")
+        db_store.create_notification({
+            "user_id": uid,
+            "title": "Penarikan Komisi Ditolak (Saldo Dikembalikan)",
+            "message": f"Penarikan komisi ditolak. Alasan: {reason}. Saldo {refund_energy}⚡ telah dikembalikan ke akun Anda.",
+            "type": "WITHDRAWAL_FAILED"
+        })
+
+    return {
+        "success": True,
+        "message": f"Penarikan ditolak. Saldo {refund_energy}⚡ telah dikembalikan ke pengguna.",
+        "withdrawal": format_admin_withdrawal_response(wd)
+    }
+
+@fastapi_app.post("/api/admin/broadcast")
+async def admin_send_broadcast(request: Request, x_session_user_id: Optional[str] = Header(None)):
+    admin_user = require_admin(x_session_user_id or active_session_user_id)
+    body = await request.json()
+    title = body.get("title", "Pengumuman Resmi Scrolic")
+    message = body.get("message", "")
+    notif_type = body.get("type", "SYSTEM_BROADCAST")
+
+    if not title or not message:
+        raise HTTPException(400, "Judul dan pesan siaran wajib diisi")
+
+    users = db_store.users
+    broadcast_count = 0
+    for u in users:
+        uid = u.get("id") or u.get("username")
+        if uid:
+            db_store.create_notification({
+                "user_id": uid,
+                "title": f"📢 {title}",
+                "message": message,
+                "type": notif_type
+            })
+            broadcast_count += 1
+
+    return {
+        "success": True,
+        "message": f"Siaran pengumuman '{title}' berhasil dikirim ke {broadcast_count} pengguna!",
+        "recipientCount": broadcast_count
+    }
 
 @fastapi_app.get("/api/users")
 async def get_all_users():
@@ -2868,6 +3363,11 @@ async def follow_user(username: str, x_session_user_id: Optional[str] = Header(N
     return {"success": True, "isFollowing": is_following, "targetFollowersCount": target["followers_count"]}
 
 # ---------------- Feed & Trade Endpoints ----------------
+class SetupConfigReq(BaseModel):
+    customDescription: Optional[str] = None
+    unlockFee: Optional[int] = None
+    followFee: Optional[int] = None
+
 @fastapi_app.get("/api/feed")
 async def get_feed(
     limit: int = Query(8),
@@ -2898,6 +3398,71 @@ async def get_feed(
             "total_count": 0 if db_store.is_mongo_connected else len(db_store.posts)
         })
 
+@fastapi_app.get("/api/users/{user_key}/closed-trades")
+async def get_user_closed_trades(
+    user_key: str,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=200),
+    x_session_user_id: Optional[str] = Header(None)
+):
+    """Paginated CLOSED trades for a user (portfolio history). Returns 20 per page by default."""
+    curr_id = x_session_user_id or active_session_user_id
+    user = db_store.find_user_by_id_or_username(user_key)
+    if not user:
+        raise HTTPException(404, "User tidak ditemukan")
+    user_posts = db_store.find_posts_by_user(user["id"]) if hasattr(db_store, "find_posts_by_user") else [
+        p for p in db_store.posts if p.get("user_id") == user["id"]
+    ]
+    closed = [p for p in user_posts if str(p.get("status", "")).upper() == "CLOSED"]
+    # Sort DESC by closed_at (fallback opened_at)
+    def _sort_key(p):
+        dt = p.get("closed_at") or p.get("opened_at") or p.get("created_at")
+        if isinstance(dt, datetime):
+            return dt
+        try:
+            return datetime.fromisoformat(str(dt).replace("Z", "+00:00")) if dt else datetime.min.replace(tzinfo=timezone.utc)
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+    closed.sort(key=_sort_key, reverse=True)
+    total = len(closed)
+    total_pages = max(1, (total + size - 1) // size)
+    page = min(page, total_pages)
+    start = (page - 1) * size
+    end = start + size
+    # Return flattened Trade objects (unwrap `.trade` from post payload) for direct FE consumption
+    formatted_posts = [format_post(p, curr_id) for p in closed[start:end]]
+    trades_flat: List[Dict[str, Any]] = []
+    for fp in formatted_posts:
+        tr = dict(fp.get("trade") or {})
+        tr["postId"] = fp.get("id")
+        tr["status"] = tr.get("status") or "CLOSED"
+        trades_flat.append(tr)
+    # Aggregate stats over ALL closed trades (not just page)
+    total_profit = sum(float(p.get("profit") or 0) for p in closed)
+    total_pips = sum(float(p.get("pips") or 0) for p in closed)
+    wins = sum(1 for p in closed if float(p.get("profit") or 0) > 0)
+    losses = sum(1 for p in closed if float(p.get("profit") or 0) < 0)
+    win_rate = round((wins / (wins + losses)) * 100, 1) if (wins + losses) > 0 else 0.0
+    return {
+        "success": True,
+        "trades": trades_flat,
+        "pagination": {
+            "page": page,
+            "size": size,
+            "total": total,
+            "totalPages": total_pages,
+            "hasMore": end < total,
+        },
+        "aggregate": {
+            "totalTrades": total,
+            "winningTrades": wins,
+            "losingTrades": losses,
+            "winRate": win_rate,
+            "totalProfitUSD": round(total_profit, 2),
+            "totalPips": round(total_pips, 1),
+        }
+    }
+
 @fastapi_app.get("/api/posts/{post_id}")
 async def get_post_by_id(post_id: str, x_session_user_id: Optional[str] = Header(None)):
     curr_id = x_session_user_id or active_session_user_id
@@ -2905,6 +3470,49 @@ async def get_post_by_id(post_id: str, x_session_user_id: Optional[str] = Header
     if not post:
         raise HTTPException(404, "Post tidak ditemukan")
     return {"success": True, "post": format_post(post, curr_id)}
+
+@fastapi_app.patch("/api/posts/{post_id}/setup-config")
+async def update_post_setup_config(
+    post_id: str,
+    req: SetupConfigReq,
+    x_session_user_id: Optional[str] = Header(None)
+):
+    curr_id = x_session_user_id or active_session_user_id
+    if not curr_id:
+        raise HTTPException(401, "Harap login terlebih dahulu")
+
+    user = db_store.find_user_by_id_or_username(curr_id)
+    post = db_store.find_post_by_id(post_id)
+    if not user or not post:
+        raise HTTPException(404, "User atau Post tidak ditemukan")
+
+    user_ids = {str(curr_id), str(user.get("id", "")), str(user.get("username", ""))}
+    owner_ids = {str(post.get("user_id", "")), str(post.get("username", ""))}
+    if not user_ids.intersection(owner_ids - {""}):
+        raise HTTPException(403, "Anda tidak memiliki akses untuk mengubah setup ini")
+
+    updates: Dict[str, Any] = {}
+    if req.customDescription is not None:
+        updates["custom_description"] = req.customDescription.strip()
+    if req.unlockFee is not None:
+        updates["unlock_price"] = max(1, min(10, req.unlockFee))
+    if req.followFee is not None:
+        updates["follow_price"] = max(1, min(10, req.followFee))
+    if not updates:
+        raise HTTPException(400, "Tidak ada perubahan setup")
+
+    updated = db_store.update_post(post_id, updates)
+    if not updated:
+        raise HTTPException(404, "Post tidak ditemukan")
+
+    formatted = format_post(updated, curr_id)
+    return {
+        "success": True,
+        "customDescription": formatted.get("customDescription", ""),
+        "unlockFee": formatted.get("unlockFee", 1),
+        "followFee": formatted.get("followFee", 1),
+        "post": formatted
+    }
 
 @fastapi_app.post("/api/posts/{post_id}/unlock")
 async def unlock_post(post_id: str, x_session_user_id: Optional[str] = Header(None)):

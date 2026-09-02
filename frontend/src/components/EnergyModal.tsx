@@ -651,6 +651,10 @@ export const EnergyModal: React.FC<EnergyModalProps> = ({
                             onClick={() => {
                               triggerHaptic('medium');
                               setActiveOrder({
+                                id: tx.mayarInvoiceId || tx.id || `temp-${Date.now()}`,
+                                userId: currentUser.id,
+                                createdAt: new Date().toISOString(),
+                                description: tx.description || 'Top Up Energy',
                                 orderId: tx.mayarInvoiceId || tx.id,
                                 amountEnergy: tx.amount,
                                 amountRp: tx.amountRp || tx.amount * 1000,

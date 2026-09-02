@@ -76,9 +76,9 @@ class SymbolRegistry:
             2: {"symbolId": 2, "name": "GBPUSD", "digits": 5, "pipPosition": 4, "lotUnits": 100000.0, "market": "Forex", "base": "GBP", "quote": "USD"},
             3: {"symbolId": 3, "name": "EURJPY", "digits": 3, "pipPosition": 2, "lotUnits": 100000.0, "market": "Forex", "base": "EUR", "quote": "JPY"},
             4: {"symbolId": 4, "name": "USDJPY", "digits": 3, "pipPosition": 2, "lotUnits": 100000.0, "market": "Forex", "base": "USD", "quote": "JPY"},
-            41: {"symbolId": 41, "name": "XAUUSD", "digits": 2, "pipPosition": 1, "lotUnits": 100.0, "lotSize": 100000.0, "measurementUnits": 1.0, "market": "Commodity", "base": "XAU", "quote": "USD"},
-            22396: {"symbolId": 22396, "name": "BTCUSD", "digits": 2, "pipPosition": 0, "lotUnits": 1.0, "market": "Crypto", "base": "BTC", "quote": "USD"},
-            22397: {"symbolId": 22397, "name": "ETHUSD", "digits": 2, "pipPosition": 1, "lotUnits": 1.0, "market": "Crypto", "base": "ETH", "quote": "USD"}
+            41: {"symbolId": 41, "name": "XAUUSD", "digits": 2, "pipPosition": 1, "lotUnits": 100.0, "lotSize": 100.0, "measurementUnits": 1.0, "market": "Commodity", "base": "XAU", "quote": "USD"},
+            22396: {"symbolId": 22396, "name": "BTCUSD", "digits": 2, "pipPosition": 0, "lotUnits": 1.0, "lotSize": 1.0, "market": "Crypto", "base": "BTC", "quote": "USD"},
+            22397: {"symbolId": 22397, "name": "ETHUSD", "digits": 2, "pipPosition": 1, "lotUnits": 1.0, "lotSize": 1.0, "market": "Crypto", "base": "ETH", "quote": "USD"}
         }
         self._symbols_by_name: Dict[str, Dict[str, Any]] = {
             v["name"]: v for v in self._symbols_by_id.values()
@@ -108,6 +108,24 @@ class SymbolRegistry:
             clean = symbol_name.upper().strip()
             if clean in self._symbols_by_name:
                 return self._symbols_by_name[clean]
+            
+            # Robust Suffix Stripping for Demo/Live brokers (e.g. BTCUSD.demo -> BTCUSD, XAUUSD.m -> XAUUSD)
+            base_clean = clean.split('.')[0].split('_')[0].split('-')[0]
+            if base_clean in self._symbols_by_name:
+                return self._symbols_by_name[base_clean]
+
+            # Heuristic Symbol Matching for Demo/Live symbols
+            if "BTC" in clean:
+                return self._symbols_by_id[22396]
+            if "ETH" in clean:
+                return self._symbols_by_id[22397]
+            if "XAU" in clean or "GOLD" in clean:
+                return self._symbols_by_id[41]
+            if "JPY" in clean:
+                return self._symbols_by_id[4]
+            if any(k in clean for k in ["EUR", "GBP", "AUD", "USD"]):
+                return self._symbols_by_id[1]
+
             return {
                 "symbolId": symbol_id or 0,
                 "name": clean,
@@ -137,24 +155,25 @@ def normalize_trade_side(value: Any, default: Optional[str] = None) -> Optional[
     return default
 
 def _lot_scale_from_symbol_meta(meta: Dict[str, Any]) -> float:
-    lot_size = meta.get("lotSize")
-    volume_scale = meta.get("volumeScale")
-    if lot_size is None or volume_scale is None:
-        lot_size = lot_size or meta.get("lotUnits")
-        volume_scale = volume_scale or 1.0
-    if lot_size is None:
-        return 0.0
-    measurement_units = meta.get("measurementUnits")
-    if measurement_units is not None and "volumeScale" not in meta:
-        try:
-            lot_size = float(lot_size) * float(measurement_units)
-        except (TypeError, ValueError):
-            pass
-    try:
-        scale = float(lot_size) * float(volume_scale)
-        return scale if scale > 0 else 0.0
-    except (TypeError, ValueError):
-        return 0.0
+    symbol_name = str(meta.get("name", "")).upper()
+    market = str(meta.get("market", "")).lower()
+    lot_units = float(meta.get("lotUnits") or meta.get("lotSize") or 100000.0)
+
+    # 1. Crypto (BTCUSD, ETHUSD)
+    # Spotware cTrader Open API: 1 Lot = 1 BTC/ETH. 0.01 Lot = 1 cent (or 0.01 unit).
+    # Raw volume in cents sent by cTrader for 0.01 Lot is 1 cent (or 1 unit).
+    if "BTC" in symbol_name or "ETH" in symbol_name or market == "crypto":
+        return 100.0 if lot_units <= 10.0 else lot_units * 100.0
+
+    # 2. Metals / Gold (XAUUSD, GOLD)
+    # Spotware cTrader Open API: 1 Lot = 100 oz. 0.01 Lot = 1 oz = 100 cents.
+    # Raw volume in cents sent by cTrader for 0.01 Lot is 100 cents.
+    if "XAU" in symbol_name or "GOLD" in symbol_name or market == "commodity":
+        return 10000.0 if lot_units <= 500.0 else lot_units * 100.0
+
+    # 3. Forex (EURUSD, GBPUSD, USDJPY, etc.)
+    # Spotware cTrader Open API: 1 Lot = 100,000 units = 10,000,000 cents. 0.01 Lot = 1,000 units = 100,000 cents.
+    return lot_units * 100.0 if lot_units < 1000000.0 else lot_units
 
 
 def normalize_volume_lots(raw_volume: Any, meta: Dict[str, Any], default: Optional[float] = None) -> Optional[float]:
@@ -162,18 +181,15 @@ def normalize_volume_lots(raw_volume: Any, meta: Dict[str, Any], default: Option
         return default
     try:
         volume_units = float(raw_volume)
+        if volume_units <= 0:
+            return default
         lot_scale = _lot_scale_from_symbol_meta(meta or {})
         if lot_scale <= 0:
             return default
         lot_value = volume_units / lot_scale
         normalized = round(lot_value, 2) if lot_value > 0 else default
-        key = (meta.get("symbolId"), meta.get("name"), volume_units, meta.get("lotSize"), meta.get("volumeScale"), normalized)
-        if key not in _scaling_debug_seen:
-            _scaling_debug_seen.add(key)
-            logger.info(
-                "[cTrader.Scaling] LOT symbolId=%s symbolName=%s rawVolume=%s lotSize=%s normalizedLot=%s",
-                meta.get("symbolId"), meta.get("name"), raw_volume, meta.get("lotSize"), normalized
-            )
+        if normalized and normalized < 0.01:
+            normalized = 0.01
         return normalized
     except (TypeError, ValueError):
         return default
@@ -257,9 +273,21 @@ class CTraderPositionService:
 
     def subscribe_symbol(self, ctid_account_id: int, symbol_id: int):
         """Sends official ProtoOASubscribeSpotsReq (2104)."""
+        if not symbol_id or symbol_id in self.subscribed_symbols:
+            return
+
+        target_acct_id = ctid_account_id
+        if not target_acct_id:
+            # Resolve primary authenticated account ID from active states if account ID 0 passed
+            active_states = [acct for acct, s in ctrader_client.account_states.items() if s.get("authStatus") == "AUTHENTICATED"]
+            if active_states:
+                target_acct_id = active_states[0]
+            else:
+                return
+
         self.subscribed_symbols.add(symbol_id)
         message = {
-            "ctidTraderAccountId": ctid_account_id,
+            "ctidTraderAccountId": target_acct_id,
             "symbolId": [symbol_id],
             "subscribeToSpotTimestamp": True
         }
@@ -1091,10 +1119,11 @@ class CTraderPositionService:
                 # Fallback Reconciliation: every 60 seconds (30 cycles)
                 if cycle_count % 30 == 0 and ctrader_client.state == "AUTHENTICATED":
                     for acct_num in list(ctrader_client.account_states.keys()):
-                        logger.debug(f"[cTrader.Fallback] Periodic fallback sync for account {acct_num}")
-                        await ctrader_client.send_message(2121, {"ctidTraderAccountId": acct_num})  # PROTO_OA_TRADER_REQ
-                        await ctrader_client.send_message(2124, {"ctidTraderAccountId": acct_num})  # PROTO_OA_RECONCILE_REQ
-                        await self.emit_account_update(f"cTrader-{acct_num}")
+                        if ctrader_client.is_account_authenticated(acct_num):
+                            logger.debug(f"[cTrader.Fallback] Periodic fallback sync for account {acct_num}")
+                            await ctrader_client.send_message(2121, {"ctidTraderAccountId": acct_num})  # PROTO_OA_TRADER_REQ
+                            await ctrader_client.send_message(2124, {"ctidTraderAccountId": acct_num})  # PROTO_OA_RECONCILE_REQ
+                            await self.emit_account_update(f"cTrader-{acct_num}")
 
                 if ctrader_client.state == "AUTHENTICATED":
                     for acct_num, account_state in list(ctrader_client.account_states.items()):

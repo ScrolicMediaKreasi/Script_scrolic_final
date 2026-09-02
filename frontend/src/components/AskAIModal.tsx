@@ -30,7 +30,6 @@ export const AskAIModal: React.FC<AskAIModalProps> = ({
   const user = post?.user;
   const strategy = post?.strategy;
   const tradeProfit = trade?.profitUSD ?? 0;
-  const tradePips = trade?.pips ?? 0;
   const [messages, setMessages] = useState<AIMessage[]>([
     {
       id: 'msg_welcome',
@@ -160,7 +159,7 @@ export const AskAIModal: React.FC<AskAIModalProps> = ({
           </div>
           <div className="text-right">
             <span className={tradeProfit >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-              {performanceContext ? 'Data historis' : `${tradeProfit >= 0 ? '+' : ''}${tradePips.toFixed(1)} Pips`}
+              {performanceContext ? 'Data historis' : `${tradeProfit >= 0 ? '+$' : '-$'}${Math.abs(tradeProfit).toFixed(2)}`}
             </span>
           </div>
         </div>

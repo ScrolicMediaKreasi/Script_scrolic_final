@@ -20,8 +20,7 @@ import {
 import { User, FeedPost, Trade } from '../types';
 import { DynamicFeedTemplate } from '../components/DynamicFeedTemplate';
 import { EditAvatarModal } from '../components/EditAvatarModal';
-import { getStrategy } from '../data/strategies';
-
+import { getStrategy } from '../data/strategies';import { safeAvatarUrl, handleAvatarError } from '../utils/avatar';
 interface ProfileViewProps {
   user: User;
   currentUser: User | null;
@@ -107,9 +106,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 title={isMe ? 'Klik untuk ubah foto profil' : undefined}
               >
                 <img 
-                  src={user.avatar} 
+                  src={safeAvatarUrl(user.avatar, user.username)} 
                   alt={user.username} 
                   referrerPolicy="no-referrer"
+                  onError={(event) => handleAvatarError(event, user.username, user.avatar)}
                   className="w-16 h-16 rounded-full object-cover border-2 border-emerald-400/90 shadow-md shadow-emerald-500/20 group-hover:opacity-90 transition-opacity"
                 />
                 {isMe && (
@@ -372,6 +372,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 onToggleSave={onToggleSave}
                 onToggleFollow={onToggleFollow}
                 onEditDescription={onEditDescription}
+                onOpenPerformance={onOpenPerformance}
               />
             ))
           )}
@@ -401,6 +402,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                     onToggleSave={onToggleSave}
                     onToggleFollow={onToggleFollow}
                     onEditDescription={onEditDescription}
+                    onOpenPerformance={onOpenPerformance}
                   />
                   {isMe && onCloseTrade && (
                     <div className="mt-1 flex justify-end">
@@ -433,9 +435,6 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
               <div className="text-right font-mono">
                 <span className={`font-bold ${(t.profitUSD ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                   {(t.profitUSD ?? 0) >= 0 ? '+' : ''}${(t.profitUSD ?? 0).toFixed(2)}
-                </span>
-                <span className="text-[10px] text-neutral-400 block">
-                  {(t.profitUSD ?? 0) >= 0 ? '+' : ''}{(t.pips ?? 0).toFixed(1)} Pips
                 </span>
               </div>
             </div>

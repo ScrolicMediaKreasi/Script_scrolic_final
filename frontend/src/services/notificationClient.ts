@@ -137,19 +137,29 @@ export class NotificationClient {
       const vapidData = await vapidRes.json();
       const publicKey = vapidData.publicKey;
 
-      if (!publicKey) {
+      if (!publicKey || typeof publicKey !== 'string' || publicKey.length < 20 || publicKey.includes('YOUR_PUBLIC_VAPID_KEY')) {
         return false;
       }
 
-      // 4. Subscribe with PushManager
-      const convertedKey = urlBase64ToUint8Array(publicKey);
+      // 4. Safely convert VAPID key & Subscribe with PushManager
+      let convertedKey: Uint8Array;
+      try {
+        convertedKey = urlBase64ToUint8Array(publicKey);
+      } catch {
+        return false;
+      }
+
       let subscription = await registration.pushManager.getSubscription();
 
       if (!subscription) {
-        subscription = await registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: convertedKey
-        });
+        try {
+          subscription = await registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: convertedKey
+          });
+        } catch {
+          return false;
+        }
       }
 
       // 5. Send subscription to server
