@@ -811,6 +811,7 @@ export default function App() {
     try {
       localStorage.removeItem('scrolic_user_id');
       document.cookie = 'scrolic_uid=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax';
+      socketClient.disconnect();
       await fetch('/api/auth/logout', { method: 'POST' });
       setCurrentUser(null);
       setIsSettingsOpen(false);

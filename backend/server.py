@@ -98,8 +98,14 @@ def require_admin(user_id: Optional[str]) -> Dict[str, Any]:
 def account_visible_to_user(account: Dict[str, Any], user: Dict[str, Any]) -> bool:
     if str(user.get("role", "user")).lower() == "admin":
         return True
+    # Ticket 243821: this used to hard-deny any non-LIVE account for regular users,
+    # which silently dropped a user's own DEMO account before it could ever become
+    # primary_acct_id or get authenticated. Cross-user account theft is handled
+    # separately by the occupied-account guard in the OAuth callback, so this only
+    # needs to reject genuinely unrecognized account types, not DEMO ownership.
     account_type = str(account.get("accountType", "")).upper()
-    return account_type == "LIVE" or account.get("isLive") is True
+    is_live_flag = account.get("isLive")
+    return account_type in ("LIVE", "DEMO") or is_live_flag is True or is_live_flag is False
 
 CTRADER_CLIENT_ID = get_ctrader_client_id()
 CTRADER_CLIENT_SECRET = get_ctrader_client_secret()
@@ -287,7 +293,9 @@ async def on_startup():
     await _mongo_writer.start()
     token_refresh_supervisor.start()
 
-    # Restore every previously authorised broker account — dispatch to correct env client
+    # Restore every previously authorised broker account — dispatch to correct env client.
+    # IMPORTANT: For users with multi-account setups (e.g. LIVE + DEMO), every account is restored
+    # on its own env client so both flows receive spot/reconcile events simultaneously.
     live_tasks: List[Dict[str, Any]] = []
     demo_tasks: List[Dict[str, Any]] = []
     for stored_user in list(db_store.users):
@@ -295,15 +303,23 @@ async def on_startup():
             continue
         user_id = stored_user.get("id") or stored_user.get("username")
         for account in stored_user.get("ctrader_accounts") or []:
-            account_id = account.get("accountId") if isinstance(account, dict) else account
+            if not isinstance(account, dict):
+                continue
+            account_id = account.get("accountId") or account.get("accountNo")
             if not account_id:
                 continue
-            target_client = resolve_client_for_user_account(stored_user, account if isinstance(account, dict) else {})
+            target_client = resolve_client_for_user_account(stored_user, account)
             task = {
                 "account_id": account_id,
                 "access_token": stored_user["ctrader_access_token"],
                 "user_id": user_id,
             }
+            account_type = str(account.get("accountType", "")).upper()
+            is_live_flag = account.get("isLive")
+            logger.info(
+                f"[cTrader.Restore] queueing @{stored_user.get('username')} account={account_id} "
+                f"type={account_type or '?'} isLive={is_live_flag} routedTo={target_client._env}"
+            )
             if target_client is ctrader_client_alt:
                 demo_tasks.append(task)
             else:
@@ -1185,9 +1201,52 @@ async def ctrader_oauth_callback(request: Request, code: str = Query(""), state:
             err_response.delete_cookie("ctrader_oauth_state", path="/api/ctrader")
             return err_response
 
-        # 5. Persist securely to user record
+        # 5. Authenticate the primary account on the persistent broker client BEFORE
+        # claiming "connected". A validated account list from the REST preflight only
+        # means the token is allowed to see these accounts — it does not mean the account
+        # has a live WebSocket session. Previously this fired authenticate_account as a
+        # background task and persisted ctrader_connected=True immediately, so the app
+        # could show "Connected" for an account that never actually authenticated on the
+        # live feed (ticket 243821: badge said Connected on every device, incl. a brand
+        # new one, while prices/profit stayed frozen because no live session existed).
+        try:
+            from backend.ctrader_client import resolve_client_for_user_account
+        except ImportError:
+            from ctrader_client import resolve_client_for_user_account
+        primary_account_obj = next(
+            (a for a in validated_accounts if str(a.get("accountId")) == str(primary_acct_id)),
+            validated_accounts[0]
+        )
+        primary_client = resolve_client_for_user_account(user, primary_account_obj)
+        account_live_authenticated = await primary_client.authenticate_account(
+            primary_acct_id,
+            access_token,
+            user.get("id") or user.get("username")
+        )
+
+        # 5b. Also authenticate every OTHER account the user just authorized (e.g. a DEMO
+        # account that isn't validated_accounts[0]) on its correct env client. Without this,
+        # only the primary account ever comes online — an approved DEMO account sitting later
+        # in the list would never get a live session even though the user granted access to it
+        # (ticket 243821: consent screen showed the demo account checked/approved, but only the
+        # live account listed first was ever authenticated).
+        _uid_for_secondary = user.get("id") or user.get("username")
+        async def _auth_secondary_oauth_account(acct_obj: Dict[str, Any]):
+            try:
+                aid = acct_obj.get("accountId") or acct_obj.get("accountNo")
+                if not aid or str(aid) == str(primary_acct_id):
+                    return
+                sec_client = resolve_client_for_user_account(user, acct_obj)
+                ok = await sec_client.authenticate_account(aid, access_token, _uid_for_secondary)
+                logger.info(f"[cTrader.OAuth.SecondaryAuth] account={aid} type={acct_obj.get('accountType')} routedTo={sec_client._env} auth={'OK' if ok else 'FAIL'}")
+            except Exception as exc:
+                logger.warning(f"[cTrader.OAuth.SecondaryAuth] error for {acct_obj.get('accountId')}: {exc}")
+        for _vacct in validated_accounts:
+            asyncio.create_task(_auth_secondary_oauth_account(_vacct))
+
+        # 6. Persist securely to user record
         user_updates = {
-            "ctrader_connected": True,
+            "ctrader_connected": account_live_authenticated,
             "ctrader_account_id": primary_acct_id,
             "ctrader_accounts": validated_accounts,
             "ctrader_access_token": access_token,
@@ -1205,13 +1264,6 @@ async def ctrader_oauth_callback(request: Request, code: str = Query(""), state:
                 "Akun cTrader berhasil terhubung",
                 datetime.now(timezone.utc).isoformat()
             ))
-
-        # 6. Authenticate account on persistent background client
-        asyncio.create_task(ctrader_client.authenticate_account(
-            primary_acct_id,
-            access_token,
-            user.get("id") or user.get("username")
-        ))
 
         user_formatted = format_auth_user_response(user) if user else {}
         user_json_str = json.dumps(user_formatted, default=str)
@@ -1339,10 +1391,27 @@ async def sync_ctrader_account_trades(user_id: str) -> dict:
             pos_id = str(pos.get("positionId") or pos.get("id") or f"pos-{int(datetime.now().timestamp())}")
             active_pos_ids.add(pos_id)
             t_data = pos.get("tradeData", {}) if isinstance(pos.get("tradeData"), dict) else pos
-            symbol = str(t_data.get("symbolName") or t_data.get("symbol") or pos.get("symbolName") or "XAUUSD")
+            # Ticket 243821: cTrader positions carry a numeric symbolId, not a symbolName string —
+            # t_data.get("symbolName") was always None, so this silently fell back to the literal
+            # string "XAUUSD" for every symbol, e.g. a BTCUSD position displayed as XAUUSD. Resolve
+            # by symbolId through the registry first (same registry deals/reconcile already use).
+            raw_symbol_id = t_data.get("symbolId") if isinstance(t_data, dict) else None
+            symbol_name_hint = t_data.get("symbolName") or t_data.get("symbol") or pos.get("symbolName")
+            symbol_meta_open = symbol_registry.resolve(
+                symbol_id=int(raw_symbol_id) if raw_symbol_id is not None else None,
+                symbol_name=symbol_name_hint
+            )
+            symbol = symbol_meta_open["name"]
             raw_side = t_data.get("tradeSide") if (isinstance(t_data, dict) and t_data.get("tradeSide") is not None) else pos.get("tradeSide")
             trade_side = "BUY" if str(raw_side or "").upper() in ["BUY", "1"] else "SELL"
-            vol = calculate_ctrader_lots(pos.get("volume", 100000), symbol)
+            # Ticket 243821: cTrader nests volume under tradeData for OPEN positions (unlike
+            # deals, which carry it top-level) — reading pos.get("volume") directly always missed
+            # it and fell back to the hardcoded 100000 default, showing every 0.01-lot position
+            # as "10 Lot". Check tradeData first, matching the working pattern in ticker.py.
+            raw_volume = (t_data.get("volume") if isinstance(t_data, dict) else None)
+            if raw_volume is None:
+                raw_volume = pos.get("volume", 100000)
+            vol = calculate_ctrader_lots(raw_volume, symbol)
             entry = float(pos.get("entryPrice") or pos.get("price") or 2914.50)
             curr_pr = float(pos.get("currentPrice") or entry)
             
@@ -1602,19 +1671,44 @@ async def ctrader_connect(request: Request, x_session_user_id: Optional[str] = H
         updates["ctrader_access_token"] = body["accessToken"]
         updates["ctrader_token_expires_at"] = datetime.now(timezone.utc) + timedelta(days=30)
 
-    # Dual-env dispatch: pick the right client based on the primary account's env + user role
+    # Dual-env dispatch: authenticate EVERY account on its correct env client so both LIVE + DEMO
+    # accounts can receive spot/reconcile events simultaneously (not just the primary).
     try:
         from backend.ctrader_client import resolve_client_for_user_account
     except ImportError:
         from ctrader_client import resolve_client_for_user_account
-    primary_account_obj = next((a for a in accounts if str(a.get("accountId")) == str(primary_id)), accounts[0] if accounts else {})
-    target_client = resolve_client_for_user_account(user, primary_account_obj)
-    account_authenticated = await target_client.authenticate_account(primary_id, access_token, curr_id)
-    if not account_authenticated:
-        auth_error = target_client.get_account_status(primary_id).get("lastError") or "Akun cTrader gagal diautentikasi ke Open API."
+    primary_account_obj = next(
+        (a for a in accounts if str(a.get("accountId")) == str(primary_id)),
+        accounts[0] if accounts else {}
+    )
+    primary_client = resolve_client_for_user_account(user, primary_account_obj)
+    primary_authenticated = await primary_client.authenticate_account(primary_id, access_token, curr_id)
+    if not primary_authenticated:
+        auth_error = primary_client.get_account_status(primary_id).get("lastError") or "Akun cTrader gagal diautentikasi ke Open API."
         if str(auth_error).startswith("WARNING:"):
             raise HTTPException(409, auth_error)
         raise HTTPException(502, "ACCOUNT_AUTH_FAILED: Akun cTrader gagal diautentikasi ke Open API.")
+
+    # Also authenticate secondary accounts on their appropriate env client (background — don't block primary path)
+    async def _auth_secondary(acct_obj: Dict[str, Any]):
+        try:
+            target_client = resolve_client_for_user_account(user, acct_obj)
+            aid = acct_obj.get("accountId") or acct_obj.get("accountNo")
+            if not aid:
+                return
+            ok = await target_client.authenticate_account(aid, access_token, curr_id)
+            logger.info(
+                f"[cTrader.MultiAuth] secondary account {aid} "
+                f"env={acct_obj.get('accountType')} isLive={acct_obj.get('isLive')} "
+                f"routedTo={target_client._env} auth={'OK' if ok else 'FAIL'}"
+            )
+        except Exception as exc:
+            logger.warning(f"[cTrader.MultiAuth] secondary auth error for {acct_obj.get('accountId')}: {exc}")
+
+    for _acct in accounts:
+        if str(_acct.get("accountId")) == str(primary_id):
+            continue
+        asyncio.create_task(_auth_secondary(_acct))
 
     db_store.update_user(curr_id, updates)
     asyncio.create_task(sync_ctrader_account_trades(curr_id))
@@ -2020,8 +2114,23 @@ async def ctrader_close_position_endpoint(position_id: str, request: Request, x_
     if not account_id:
         raise HTTPException(400, "Account ID tidak ditemukan untuk posisi ini.")
 
+    # Ticket 243821: this always dispatched on the hardcoded live-only ctrader_client, whose
+    # account_states never includes a DEMO account — is_account_authenticated() would find
+    # nothing there and silently refuse the close, even though the account is genuinely
+    # authenticated on ctrader_client_alt (demo). Resolve the correct env client per-account,
+    # same as the OAuth/connect/switch flows already do.
+    try:
+        from backend.ctrader_client import resolve_client_for_user_account
+    except ImportError:
+        from ctrader_client import resolve_client_for_user_account
+    close_account_obj = next(
+        (a for a in (user.get("ctrader_accounts") or []) if str(a.get("accountId")) == str(account_id) or str(a.get("accountId")) == f"cTrader-{account_id}"),
+        {}
+    )
+    close_client = resolve_client_for_user_account(user, close_account_obj)
+
     # Dispatch official close request to Spotware broker
-    success = await ctrader_client.close_position(account_id, position_id, volume_lot, symbol_id)
+    success = await close_client.close_position(account_id, position_id, volume_lot, symbol_id)
     if not success:
         return JSONResponse({"success": False, "message": "Gagal mengirim permintaan close posisi ke broker cTrader"}, status_code=500)
 
@@ -2453,6 +2562,8 @@ async def auth_register(request: Request):
 
 @fastapi_app.post("/api/auth/logout")
 async def auth_logout():
+    global active_session_user_id
+    active_session_user_id = None
     return {"success": True}
 
 # ---------------- User Endpoints ----------------

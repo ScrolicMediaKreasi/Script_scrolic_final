@@ -14,6 +14,7 @@ Spec & Official Spotware Open API v2 Protocol:
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -89,7 +90,13 @@ class SymbolRegistry:
             3: {"symbolId": 3, "name": "EURJPY", "digits": 3, "pipPosition": 2, "lotUnits": 100000.0, "market": "Forex", "base": "EUR", "quote": "JPY"},
             4: {"symbolId": 4, "name": "USDJPY", "digits": 3, "pipPosition": 2, "lotUnits": 100000.0, "market": "Forex", "base": "USD", "quote": "JPY"},
             41: {"symbolId": 41, "name": "XAUUSD", "digits": 2, "pipPosition": 1, "lotUnits": 100.0, "lotSize": 100.0, "measurementUnits": 1.0, "market": "Commodity", "base": "XAU", "quote": "USD"},
-            22396: {"symbolId": 22396, "name": "BTCUSD", "digits": 2, "pipPosition": 0, "lotUnits": 1.0, "lotSize": 1.0, "market": "Crypto", "base": "BTC", "quote": "USD"},
+            # Ticket 243821: 22396 was a fabricated/guessed BTCUSD id that never matched this
+            # broker (FPMarkets) — confirmed live: the customer's real BTCUSD trades carry
+            # symbolId 101 (seen both in broker_deals and in production's own SYMBOL_101
+            # fallback label after the resolve-by-id fix). Registering the confirmed real id
+            # so BTCUSD gets a correct name AND correct crypto lot/margin metadata instead of
+            # the unknown-symbol placeholder's forex-scale defaults (lotUnits 100000).
+            101: {"symbolId": 101, "name": "BTCUSD", "digits": 2, "pipPosition": 0, "lotUnits": 1.0, "lotSize": 1.0, "market": "Crypto", "base": "BTC", "quote": "USD"},
             22397: {"symbolId": 22397, "name": "ETHUSD", "digits": 2, "pipPosition": 1, "lotUnits": 1.0, "lotSize": 1.0, "market": "Crypto", "base": "ETH", "quote": "USD"}
         }
         self._symbols_by_name: Dict[str, Dict[str, Any]] = {
@@ -265,6 +272,11 @@ class CTraderPositionService:
         # Realtime market prices from ProtoOASpotEvent: { symbol: { bid, ask, timestamp } }
         self.market_prices: Dict[str, Dict[str, Any]] = {}
         self.subscribed_symbols: Set[int] = set()
+        # Ticket 243821: per-post monotonic timestamp of the last spot-persist, for the
+        # 1s throttle in handle_spot_event (see comment there).
+        self._spot_persist_ts: Dict[str, float] = {}
+        # Symbols whose first spot tick has been logged this process (scale diagnostics).
+        self._spot_first_tick_logged: Set[str] = set()
 
         # Deal tracking idempotency & cursor state
         self.processed_deal_ids: Set[str] = set()
@@ -272,10 +284,18 @@ class CTraderPositionService:
 
         # Hook into persistent ctrader_client handlers — register on BOTH live+demo clients
         # so spot/execution/reconcile/deal events from either environment flow into the ticker.
+        # Ticket 243821 (frozen prices, the deepest layer): this import MUST resolve to the SAME
+        # module copy as the module-level imports above (backend.ctrader_client) — that is the
+        # copy whose clients on_startup() actually starts and whose websocket receives broker
+        # events. With /app AND /app/backend both on sys.path, importing top-level
+        # `ctrader_client` first silently loads a SECOND copy of the module with its own never-
+        # started client instances, and handlers registered there never fire — no spot
+        # subscriptions sent, no price/pnl updates written, no close/open card transitions.
+        # backend-first keeps registration on the live clients.
         try:
-            from ctrader_client import register_handler_on_all
-        except ImportError:
             from backend.ctrader_client import register_handler_on_all
+        except ImportError:
+            from ctrader_client import register_handler_on_all
         register_handler_on_all(PROTO_OA_SPOT_EVENT, self.handle_spot_event)
         register_handler_on_all(PROTO_OA_EXECUTION_EVENT, self.handle_execution_event)
         register_handler_on_all(PROTO_OA_SYMBOLS_LIST_RES, self.handle_symbols_list_event)
@@ -344,8 +364,18 @@ class CTraderPositionService:
                         return existing.get(field_key, default_value)
                     return raw
 
+                # Ticket 243821: protobuf3 serializes absent int fields as 0, and this broker's
+                # lightweight SymbolsList (2115) carries no digits/pipPosition at all — a raw 0
+                # here would clobber the correct registry defaults (e.g. XAUUSD digits=2) and
+                # make the spot-tick /10**digits scaling a no-op, storing raw broker units
+                # (1000x) as currentPrice. Treat 0/negative as "not provided" and keep the
+                # existing registry value.
                 digits_val = int(pick("digits", 5))
+                if digits_val <= 0:
+                    digits_val = int(existing.get("digits", 5) or 5)
                 pip_pos_val = int(pick("pipPosition", 4))
+                if pip_pos_val <= 0:
+                    pip_pos_val = int(existing.get("pipPosition", 4) or 4)
                 lot_units_val = float(symbol.get("lotSize") if symbol.get("lotSize") is not None else (symbol.get("lotUnits") if symbol.get("lotUnits") is not None else existing.get("lotUnits", 100000.0)))
                 lot_size_val = float(symbol["lotSize"]) if symbol.get("lotSize") is not None else (existing.get("lotSize") if existing.get("lotSize") is not None else None)
                 measurement_units_val = float(symbol["measurementUnits"]) if symbol.get("measurementUnits") is not None else (existing.get("measurementUnits") if existing.get("measurementUnits") is not None else None)
@@ -397,15 +427,66 @@ class CTraderPositionService:
             if bid_val <= 0:
                 return
 
+            # Ticket 243821 (spot-scale auto-heal): this broker's feed scale can disagree with
+            # the registry's digits (live-observed: BTCUSD symbolId 101 raw=8,151,850,000 with
+            # registry digits=2 → 81,518,500 vs true ~81,518.5 — real scale 10^5). Broker-sourced
+            # ENTRY prices on positions are correctly scaled, so use the first open position's
+            # entry as ground truth: when the tick is a near-power-of-ten away from it, rescale
+            # the tick by that power. A genuine >=10x market move between entry and now is not
+            # a realistic intraday event for these instruments; the ratio must also land within
+            # a factor of 3 of an exact power of ten to count as a scale error.
+            _ref_entry = 0.0
+            for _p in db_store.posts:
+                if _p.get("status") == "OPEN" and _p.get("symbol") == symbol_name:
+                    _ref_entry = float(_p.get("entry_price") or 0.0)
+                    break
+            if _ref_entry > 0:
+                _ratio = bid_val / _ref_entry
+                if _ratio > 10.0 or _ratio < 0.1:
+                    _k = round(math.log10(_ratio))
+                    if _k != 0 and abs(_k) <= 6 and 0.33 <= (_ratio / (10 ** _k)) <= 3.0:
+                        bid_val /= (10 ** _k)
+                        ask_val /= (10 ** _k)
+                        logger.warning(f"[cTrader.Spot] {symbol_name} auto-rescaled tick by 10^{_k}: digits={meta['digits']} rawBid={raw_bid} refEntry={_ref_entry} -> bid={bid_val} ask={ask_val}")
+
             self.market_prices[symbol_name] = {
                 "bid": bid_val,
                 "ask": ask_val,
                 "timestamp": ts
             }
 
-            # Update all open posts for this symbol
+            # Update all open posts for this symbol.
+            # Ticket 243821 (event-loop starvation): once handlers actually fire (post wiring
+            # fix), spot ticks arrive many times per second per symbol. compute_position_payload
+            # does a synchronous Mongo update_post per post per tick, which saturated the
+            # single uvicorn worker — /health through nginx started timing out and the k8s
+            # liveness probe nearly killed the pod. The in-memory market_prices cache above
+            # stays fresh on EVERY tick (cheap); the expensive persist+emit per post is
+            # throttled to at most once per second — the feed UI polls at roughly that rate
+            # anyway, so visible realtime behavior is unchanged.
+            now_mono = time.monotonic()
+            # Ticket 243821 (price-scale debug): log the first tick per symbol per process so
+            # raw broker scale vs applied digits is visible in prod logs — needed to pin the
+            # exact digits semantics of this broker's feed.
+            if symbol_name not in self._spot_first_tick_logged:
+                self._spot_first_tick_logged.add(symbol_name)
+                logger.info(f"[cTrader.Spot] FIRST TICK {symbol_name}: rawBid={raw_bid} rawAsk={raw_ask} digits={meta['digits']} scaledBid={bid_val} scaledAsk={ask_val}")
             open_posts = [p for p in db_store.posts if p.get("status") == "OPEN" and p.get("symbol") == symbol_name]
             for post in open_posts:
+                # Plausibility guard vs the position's own entry price: a tick more than 10x
+                # away from entry is a scale error (e.g. digits mismatch → 1000x), not a market
+                # move. Skip persisting it and warn — profitUSD (broker PnL poll) stays correct.
+                entry_for_guard = float(post.get("entry_price") or 0.0)
+                if entry_for_guard > 0:
+                    ratio = bid_val / entry_for_guard
+                    if ratio > 10.0 or ratio < 0.1:
+                        logger.warning(f"[cTrader.Spot] {symbol_name} tick bid={bid_val} is {ratio:.0f}x entry {entry_for_guard} — scale mismatch suspected (digits={meta['digits']}, raw={raw_bid}); skipping persist for post {post.get('id')}")
+                        continue
+                post_key = str(post.get("id"))
+                last_persist = self._spot_persist_ts.get(post_key, 0.0)
+                if (now_mono - last_persist) < 1.0:
+                    continue
+                self._spot_persist_ts[post_key] = now_mono
                 payload = self.compute_position_payload(post, bid_price=bid_val, ask_price=ask_val)
                 if payload and self.sio:
                     loop = asyncio.get_event_loop()
@@ -413,6 +494,25 @@ class CTraderPositionService:
                         loop.create_task(self.emit_position_update(payload))
         except Exception as exc:
             logger.error(f"[cTrader.Spot] handle_spot_event error: {exc}")
+
+    def subscribe_default_symbols(self, acct_num: int):
+        """Subscribe to a curated set of popular symbols right after account auth so spot events
+        start flowing even before any open position/reconcile is available (fixes silence when
+        the account has no positions yet). Idempotent — subscribe_symbol de-dupes by symbol_id.
+        """
+        if not acct_num:
+            return
+        # Popular default set – covers XAU, BTC, majors, indices
+        default_names = ["XAUUSD", "BTCUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF"]
+        for name in default_names:
+            meta = symbol_registry.resolve(symbol_name=name)
+            sym_id = meta.get("symbolId") if isinstance(meta, dict) else None
+            if sym_id:
+                try:
+                    self.subscribe_symbol(acct_num, int(sym_id))
+                except Exception as exc:
+                    logger.debug(f"[cTrader.DefaultSubs] subscribe_symbol({acct_num}, {sym_id}) skipped: {exc}")
+        logger.info(f"[cTrader.DefaultSubs] Subscribed default symbol set for account {acct_num}")
 
     def handle_reconcile_event(self, event_data: Dict[str, Any]):
         """
@@ -428,6 +528,9 @@ class CTraderPositionService:
                 return
             positions = event_data.get("position", [])
             logger.info(f"[cTrader.Reconcile] Reconciling {len(positions)} active positions for account {acct_num} (User: {user_id})")
+
+            # Always subscribe to default symbols so ticks flow even when no positions exist yet
+            self.subscribe_default_symbols(acct_num)
 
             reconciled_position_ids: Set[str] = set()
 
@@ -567,6 +670,9 @@ class CTraderPositionService:
                             account["currency"] = account_state.get("currency", account.get("currency", "USD"))
                     db_store.update_user(user.get("id") or user.get("username"), {"ctrader_accounts": accounts})
             db_store.record_account_snapshot(f"cTrader-{acct_num}", self.get_account_live_state(f"cTrader-{acct_num}"))
+            # Ensure default spot subscriptions are active for this account (idempotent). Runs on auth-time trader event
+            # so realtime price ticks start flowing even when the account has zero open positions.
+            self.subscribe_default_symbols(acct_num)
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 loop.create_task(self.emit_account_update(f"cTrader-{acct_num}"))
@@ -932,7 +1038,7 @@ class CTraderPositionService:
         meta = symbol_registry.resolve(symbol_name=symbol)
         side = str(post.get("position_type", "BUY")).upper()
         entry = float(post.get("entry_price") or post.get("price") or 0.0)
-        lot = float(post.get("lot", 0.1))
+        lot = float(post.get("lot", 0.01))
         pip_size = 10 ** (-meta["pipPosition"])
 
         # Fetch latest prices from Spotware spot cache if not directly supplied
@@ -1065,7 +1171,7 @@ class CTraderPositionService:
             total_unrealized_pnl += pnl
             
             entry = float(post.get("entry_price", 0.0))
-            lot = float(post.get("lot", 0.1))
+            lot = float(post.get("lot", 0.01))
             meta = symbol_registry.resolve(symbol_name=post.get("symbol", "XAUUSD"))
             lot_units = meta.get("lotUnits", 100000.0)
             
@@ -1134,11 +1240,12 @@ class CTraderPositionService:
     async def _service_loop(self, interval_sec: float = 2.0):
         logger.info(f"[CTraderPositionService] Persistent Realtime Engine active ({interval_sec}s cycle).")
         cycle_count = 0
-        # Import here to avoid circular
+        # Import here to avoid circular — backend-first: must resolve to the same module copy
+        # whose clients on_startup() starts (see the register_handler_on_all note above).
         try:
-            from ctrader_client import all_ctrader_clients
-        except ImportError:
             from backend.ctrader_client import all_ctrader_clients
+        except ImportError:
+            from ctrader_client import all_ctrader_clients
         while self._running:
             try:
                 cycle_count += 1

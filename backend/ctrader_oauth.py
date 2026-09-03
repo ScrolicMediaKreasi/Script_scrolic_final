@@ -170,30 +170,60 @@ async def exchange_code_for_token(code: str, redirect_uri: str) -> Dict[str, Any
     }
 
 async def fetch_and_validate_accounts(access_token: str) -> List[Dict[str, Any]]:
-    """Fetches authorized accounts using the official Open API protobuf flow."""
+    """Fetches authorized accounts using the official Open API protobuf flow.
+
+    Each account is classified by the broker's own `isLive` flag returned in
+    ProtoOAGetCtidProfileByTokenRes / ProtoOAGetAccountListByAccessTokenRes.
+    We DO NOT rely on the server's CTRADER_ENV — a single access token can
+    authorize accounts across BOTH live and demo brokers and each account
+    must route to its own env-specific WebSocket client.
+    """
     if not access_token:
         return []
     from backend.ctrader_client import ctrader_client
     raw_accounts = await ctrader_client.get_accounts_by_access_token(access_token)
-    validated_accounts = []
+    validated_accounts: List[Dict[str, Any]] = []
     for account in raw_accounts:
         acct_num = str(account.get("ctidTraderAccountId") or "")
         if not acct_num:
             continue
-        is_live = bool(account.get("isLive", False))
+        raw_is_live = account.get("isLive")
+        # Robust boolean parsing: broker may return bool, int (0/1), or string
+        if isinstance(raw_is_live, bool):
+            is_live = raw_is_live
+        elif isinstance(raw_is_live, int):
+            is_live = bool(raw_is_live)
+        elif isinstance(raw_is_live, str):
+            is_live = raw_is_live.strip().lower() in ("true", "1", "yes", "live")
+        else:
+            # Broker didn't set the flag – default to LIVE only when server env is live,
+            # else default to DEMO. This preserves the safest interpretation without wiping data.
+            server_env = (os.environ.get("CTRADER_ENV") or os.environ.get("CTRADER_ENVIRONMENT") or "live").strip().lower()
+            is_live = server_env == "live"
+            logger.warning(
+                f"[cTrader.OAuth] Broker did not return isLive for account {acct_num}. "
+                f"Falling back to server env '{server_env}' → is_live={is_live}"
+            )
+        account_type = "LIVE" if is_live else "DEMO"
         validated_accounts.append({
             "accountId": f"cTrader-{acct_num}",
             "accountNo": acct_num,
             "brokerName": "Spotware cTrader",
-            "accountType": "LIVE" if is_live else "DEMO",
+            "accountType": account_type,
             "currency": "USD",
             "balance": 0.0,
             "leverage": 500,
             "isLive": is_live,
             "source": "broker_ctrader"
         })
+        logger.info(
+            f"[cTrader.OAuth] Validated account={acct_num} type={account_type} isLive={is_live} "
+            f"→ will route to '{'live' if is_live else 'demo'}' client (.ctraderapi.com)"
+        )
     if validated_accounts:
-        logger.info(f"[cTrader.OAuth] Validated {len(validated_accounts)} accounts with Open API.")
+        live_count = sum(1 for a in validated_accounts if a["isLive"])
+        demo_count = len(validated_accounts) - live_count
+        logger.info(f"[cTrader.OAuth] Total validated: {len(validated_accounts)} accounts ({live_count} LIVE, {demo_count} DEMO).")
     return validated_accounts
 
 async def refresh_user_token(user_id: str) -> bool:
@@ -264,12 +294,24 @@ async def refresh_user_token(user_id: str) -> bool:
             "ctrader_accounts": validated_accounts,
             "ctrader_connected": True
         })
-        from backend.ctrader_client import ctrader_client
+        from backend.ctrader_client import resolve_client_for_user_account
         user_id = user.get("id") or user.get("username")
+        # Route each account to its correct env client (LIVE/DEMO) so both flows re-auth in parallel
         for account in validated_accounts:
-            account_id = account.get("accountId") if isinstance(account, dict) else account
-            if account_id:
-                await ctrader_client.authenticate_account(account_id, new_access_token, user_id)
+            if not isinstance(account, dict):
+                continue
+            account_id = account.get("accountId") or account.get("accountNo")
+            if not account_id:
+                continue
+            target_client = resolve_client_for_user_account(user, account)
+            try:
+                await target_client.authenticate_account(account_id, new_access_token, user_id)
+                logger.info(
+                    f"[cTrader.Refresh] re-authenticated account={account_id} "
+                    f"type={account.get('accountType')} routedTo={target_client._env}"
+                )
+            except Exception as exc:
+                logger.warning(f"[cTrader.Refresh] re-auth error for {account_id}: {exc}")
         logger.info(f"[cTrader.Refresh] Successfully refreshed and validated token for user: {user.get('username')}")
         return True
     except Exception as exc:

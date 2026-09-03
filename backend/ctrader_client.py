@@ -76,6 +76,14 @@ PROTO_OA_RECONCILE_RES = 2125
 PROTO_OA_TRADER_REQ = 2121
 PROTO_OA_TRADER_RES = 2122
 PROTO_OA_MARGIN_CHANGED_EVENT = 2156
+# Ticket 243821: this was briefly "fixed" to 2107 based on a mistaken comment claiming 2111
+# was ProtoOAExpectedMarginReq. That is wrong on both counts, confirmed directly against the
+# vendored Spotware library (ctrader_open_api.messages.OpenApiModelMessages_pb2.ProtoOAPayloadType):
+# 2111 = PROTO_OA_CLOSE_POSITION_REQ (correct, matches the official Open API v2 spec), while
+# 2107 = PROTO_OA_TRAILING_SL_CHANGED_EVENT (an unrelated event, not a close request) and
+# 2139 = PROTO_OA_EXPECTED_MARGIN_REQ. Sending 2107 for a close is why prod logged "Error
+# sending payload 2107: Protocol message ProtoOATrailingSLChangedEvent has no volume field"
+# and every close silently failed. Reverted to the verified-correct value.
 PROTO_OA_CLOSE_POSITION_REQ = 2111
 PROTO_OA_DEAL_LIST_REQ = 2133
 PROTO_OA_DEAL_LIST_RES = 2134
@@ -802,7 +810,7 @@ class CTraderClient:
 
     async def close_position(self, account_id: Any, position_id: Any, volume_lot: Optional[float] = None, symbol_id: int = 0) -> bool:
         """
-        Sends official ProtoOAClosePositionReq (2107) to Spotware cTrader Open API server.
+        Sends official ProtoOAClosePositionReq (2111) to Spotware cTrader Open API server.
         Volume is specified in cents of the symbol lot size.
         """
         acct_num = self._clean_numeric_account_id(account_id)
@@ -822,7 +830,7 @@ class CTraderClient:
             return False
 
         volume_cents = self._lots_to_volume_cents(volume_lot or 1.0)
-        logger.info(f"[cTrader.Close] Dispatching ProtoOAClosePositionReq (2107) for Account {acct_num}, Position {pos_num}, Volume: {volume_cents} cents")
+        logger.info(f"[cTrader.Close] Dispatching ProtoOAClosePositionReq (2111) for Account {acct_num}, Position {pos_num}, Volume: {volume_cents} cents")
         await self.send_message(PROTO_OA_CLOSE_POSITION_REQ, {
             "ctidTraderAccountId": acct_num,
             "positionId": pos_num,
@@ -915,6 +923,27 @@ class CTraderClient:
             self.account_states[acct_num]["authStatus"] = AccountAuthStatus.AUTHENTICATED.value
             self.account_states[acct_num]["authenticatedAt"] = now_iso
             self.account_states[acct_num]["lastError"] = None
+
+        # Ticket 243821 (frozen prices root cause): ticker.CTraderPositionService.subscribe_symbol()
+        # dedupes by symbol_id in a set that lives for the whole process lifetime. The outer
+        # connection loop (run()) reconnects and re-authenticates accounts on any transport drop
+        # WITHOUT restarting the process (see _reauthenticate_all_accounts, triggered from the
+        # reconnect branch of run()) — but that dedup set is never cleared, so on the new session
+        # subscribe_symbol() sees the symbol_id already marked "subscribed" and silently skips
+        # resending ProtoOASubscribeSpotsReq (2104). No fresh subscription ever reaches the broker,
+        # so no ProtoOASpotEvent (2131) ticks arrive on the new connection — prices/profitUSD stay
+        # frozen even though /api/ctrader/connection/status correctly reports AUTHENTICATED, because
+        # the account-auth and reconcile machinery all genuinely succeed; only the spot subscription
+        # is silently starved. Clear the dedupe set on every (re-)auth so the reconcile-triggered
+        # subscribe_symbol calls below always actually resend on the current connection.
+        try:
+            try:
+                from backend.ticker import ctrader_position_service
+            except ImportError:
+                from ticker import ctrader_position_service
+            ctrader_position_service.subscribed_symbols.clear()
+        except Exception as exc:
+            logger.warning(f"[cTrader.Auth] Could not reset spot subscription cache on (re)auth: {exc}")
 
         # Kick off ordered post-auth requests: Trader + SymbolsList first, then Reconcile + DealList.
         # Waiting for symbols list ensures pipPosition/digits/lotUnits are populated before deals arrive
@@ -1068,6 +1097,7 @@ class CTraderClient:
 
         if payload_type == PROTO_OA_GET_ACCOUNT_LIST_RES:
             accounts = payload_data.get("ctidTraderAccount", []) or []
+            logger.info(f"[cTrader.OAuth.RAWDEBUG] queried env={self._env} host bound to this client instance; raw accounts count={len(accounts)}: {accounts}")
             if self._account_list_future and not self._account_list_future.done():
                 self._account_list_future.set_result(accounts)
             return
