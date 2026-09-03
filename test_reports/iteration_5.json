@@ -1,0 +1,42 @@
+{
+  "summary": "Iteration 5 verification of the production socket.io path fix + baseline regression checks. Backend: 7/7 pytest tests pass (engine.io handshake on /api/socket.io returns 200 with '0{...sid...}', root /socket.io correctly 404s, full polling session handshake->40 namespace connect ack works through the preview ingress, health OK, closed-trades baseline intact at total=191/winRate=49.2/totalProfitUSD=-1117.30, dual-env live+demo both AUTHENTICATED, /api/feed returns posts). Frontend: with a session present the app opens a socket.io connection using ONLY polling on /api/socket.io (5 requests captured: 1 handshake GET + 4 sid-bound GET/POST), console logs '[SocketClient] Connected ... 25ab9Wa6WHV8B8mdAAAH', and NO socket.io WebSocket upgrade is attempted (only the Vite HMR wss:// dev socket appears). Feed renders 8 position-progress-bar elements; XAUUSD closed card shows -$7.80 and -0.19% badge as baseline. No blocking issues found.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/socket.io (engine.io handshake)", "issue": "Server handshake still advertises upgrades:[\"websocket\"] (AsyncServer allow_upgrades=True). Harmless for this app's client (upgrade:false), but any third-party/reconnecting client would try a WS upgrade that prod ingress cannot proxy. Consider allow_upgrades=False for consistency."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {"flow": "market:tick consumption", "issue": "Backend now emits `market:tick` on every spot event, but there is NO listener anywhere in /app/frontend/src (grep for 'market:tick' returns nothing) and socketClient exposes no onMarketTick subscription. The new broadcast is currently a dead payload on the client side.", "affected_selectors": ["src/services/socketClient.ts", "src/App.tsx"]},
+      {"flow": "Guest/public feed realtime", "issue": "socketClient.connect() is only invoked in App.tsx L436 when currentUser?.id exists. Unauthenticated (public preview) visitors never open a socket, so market:tick / live price movement can never reach guest sessions even after a broker connects.", "affected_selectors": ["src/App.tsx:429-436"]},
+      {"flow": "market:tick fan-out", "issue": "sio.emit('market:tick', ...) in ticker.py has no room/namespace scoping, so every tick is broadcast to every connected client over polling. With polling-only transport this multiplies long-poll traffic; consider a symbol room or client-side subscribe.", "affected_selectors": ["backend/ticker.py:465"]}
+    ],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_socketio_prod_path.py",
+    "/app/test_reports/pytest/iter5_results.xml"
+  ],
+  "action_items": [
+    "Optional: add a `market:tick` listener/subscription (onMarketTick) in socketClient.ts and wire it to price widgets, otherwise the new backend emit is unused.",
+    "Optional: connect socket.io for guest sessions (or document that realtime is authenticated-only).",
+    "Optional: set allow_upgrades=False on socketio.AsyncServer so the handshake does not advertise a websocket upgrade prod ingress cannot serve.",
+    "Note: uvicorn --reload watches /app/backend including tests/, so writing a test file restarts the backend and briefly drops cTrader auth (states go CONNECTING and API calls fail for ~30s). Consider a reload-exclude for tests/ to avoid false failures."
+  ],
+  "critical_code_review_comments": [
+    "server.py L4177 socketio_path='/api/socket.io' + socketClient.ts path '/api/socket.io' are consistent and verified end-to-end through the preview ingress.",
+    "socketClient.ts uses io() with no explicit URL (same-origin). This works in preview/prod where frontend and backend share the origin, but it ignores REACT_APP_BACKEND_URL — it will break if the two are ever split across origins.",
+    "ticker.py market:tick emit is inside handle_spot_event with no throttle; at high spot rates this can flood the socket.io broadcast queue.",
+    "Log check: '[cTrader.Client] Dual-env clients ready: main=live, alt=demo' appears ONCE per boot (not twice as the request expected) — informational only, dual-env is healthy per /api/ctrader/connection/status."
+  ],
+  "updated_files": ["/app/backend/tests/test_socketio_prod_path.py", "/app/test_reports/iteration_5.json"],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "seed_data_creation": "None. Frontend session simulated by setting localStorage scrolic_user_id='ptsmiea' (no data written).",
+  "should_call_test_agent_after_fix": false,
+  "should_main_agent_self_test": true,
+  "test_credentials": "None required; /app/memory/test_credentials.md documents that all users currently have ctrader_connected=false, so no live spot events fire.",
+  "context_for_next_testing_agent": "Run `pytest /app/backend/tests/test_socketio_prod_path.py` for the socket.io + baseline regression suite. IMPORTANT: creating/editing any file under /app/backend triggers uvicorn --reload; wait ~40s before asserting cTrader AUTHENTICATED state. To exercise the browser socket path without Google OAuth, set localStorage 'scrolic_user_id' to 'ptsmiea' then reload — App.tsx will resolve currentUser and call socketClient.connect(). market:tick cannot be observed end-to-end until a cTrader OAuth session exists AND a frontend listener is added.",
+  "rca_of_the_issue": "No defect reproduced. Transient '[API] Failed to fetch' console errors seen in the first browser run were caused by the backend hot-reload my own test-file write triggered; a follow-up in-page loop of /api/feed, /api/user/me, /api/notifications, /api/users, /api/health returned 200 for all 10 calls."
+}

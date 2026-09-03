@@ -455,6 +455,23 @@ class CTraderPositionService:
                 "timestamp": ts
             }
 
+            # Broadcast a lightweight market:tick event on EVERY spot event so subscribers
+            # (e.g. price-only widgets, sparklines) get realtime updates independent of the
+            # per-position throttle below. Payload is intentionally tiny — no DB writes.
+            if self.sio:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(self.sio.emit("market:tick", {
+                            "symbol": symbol_name,
+                            "symbolId": symbol_id,
+                            "bid": bid_val,
+                            "ask": ask_val,
+                            "ts": ts,
+                        }))
+                except Exception:
+                    pass
+
             # Update all open posts for this symbol.
             # Ticket 243821 (event-loop starvation): once handlers actually fire (post wiring
             # fix), spot ticks arrive many times per second per symbol. compute_position_payload

@@ -124,7 +124,7 @@ try:
         cors_allowed_origins="*",
         cors_credentials=False,
         always_connect=True,
-        allow_upgrades=True
+        allow_upgrades=False
     )
 
     @sio.event
@@ -4171,7 +4171,9 @@ async def root():
     return {"service": "scrolic-single-runtime", "ok": True}
 
 # Safely wrap FastAPI app with Socket.IO ASGI app if socketio is available, else fallback to fastapi_app directly
+# NOTE: socket.io mounted under /api/socket.io so production ingress rules that only proxy /api/*
+# also forward socket.io polling requests to the backend (avoids needing WebSocket upgrade support).
 if HAS_SOCKETIO and sio is not None:
-    app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app, socketio_path="socket.io")
+    app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app, socketio_path="/api/socket.io")
 else:
     app = fastapi_app

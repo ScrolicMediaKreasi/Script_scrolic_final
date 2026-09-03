@@ -139,9 +139,12 @@ class SocketClient {
     this.isConnecting = true;
 
     try {
+      // Path `/api/socket.io` + polling-only transport so production ingress rules that only
+      // forward `/api/*` (without WebSocket upgrade support) still receive live tick events.
       this.socket = io({
-        path: '/socket.io',
-        transports: ['websocket', 'polling'],
+        path: '/api/socket.io',
+        transports: ['polling'],
+        upgrade: false,
         auth: {
           userId: this.currentUserId
         },
