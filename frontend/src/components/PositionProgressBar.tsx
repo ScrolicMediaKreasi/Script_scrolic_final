@@ -1,11 +1,15 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { CheckCircle2, XCircle } from 'lucide-react';
 import { Trade } from '../types';
-import { formatPrice, maskPartialPrice } from '../utils/formatters';
+import { formatPrice } from '../utils/formatters';
 
 interface PositionProgressBarProps {
   trade: Trade;
   isLocked?: boolean;
   strategyGradient?: string;
+  strategyName?: string;
+  strategyAccentColor?: string;
+  strategyBadgeClass?: string;
 }
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
@@ -72,17 +76,19 @@ export function computePositionMetrics({
 
 /**
  * Position Trade Progress Bar (dark glass, premium)
- * Layout: SL ────── Entry ══════ NOW ────── TP
+ * Layout: risk zone, progress zone, and remaining zone
  *  - SL→Entry: red risk zone
  *  - Entry→NOW: green filled progress
  *  - NOW→TP: dim/transparent remaining
  *  - NOW: neon green glowing dot with pulse
- *  - Floating badge below NOW: "XX% Position"
+ *  - Fixed centered badge below the bar: "XX% Position"
  *  - Supports LONG & SHORT; smooth transitions on tick updates
  */
 export const PositionProgressBar: React.FC<PositionProgressBarProps> = ({
   trade,
-  isLocked = false,
+  strategyName,
+  strategyAccentColor,
+  strategyBadgeClass,
 }) => {
   const safeTrade = trade || ({} as Trade);
   const {
@@ -190,14 +196,13 @@ export const PositionProgressBar: React.FC<PositionProgressBarProps> = ({
     }
   }, [currentPrice]);
 
-  // Price display strings
-  const slDisplay = hasSL ? (isLocked ? maskPartialPrice(stopLoss, symbol) : formatPrice(stopLoss, symbol)) : '-';
-  const entryDisplay = isLocked ? maskPartialPrice(entryPrice, symbol) : formatPrice(entryPrice, symbol);
   const nowDisplay = formatPrice(currentPrice || entryPrice, symbol);
-  const tpDisplay = hasTP ? (isLocked ? maskPartialPrice(takeProfit, symbol) : formatPrice(takeProfit, symbol)) : '-';
 
   const dotColor = isProfit ? '#22c55e' : '#f43f5e';
   const dotGlow = isProfit ? 'rgba(34,197,94,0.65)' : 'rgba(244,63,94,0.6)';
+  const isClosed = status === 'CLOSED';
+  const isClosedProfit = Number(profitUSD) > 0;
+  const closePercent = isClosedProfit ? tpPercent : slPercent;
 
   return (
     <div
@@ -211,35 +216,42 @@ export const PositionProgressBar: React.FC<PositionProgressBarProps> = ({
         WebkitBackdropFilter: 'blur(14px)',
       }}
     >
-      {/* Marker labels row (SL / Entry / Now / TP) — each anchored to its bar percentage */}
+      {/* Direction badge moved from the pair header into the progress bar. */}
+      <div
+        className={`absolute left-4 top-3 inline-flex items-center rounded-md border px-2.5 py-0.5 text-xl font-extrabold leading-none tracking-tight uppercase ${
+          isBuy
+            ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-400'
+            : 'border-rose-500/30 bg-rose-500/15 text-rose-400'
+        }`}
+      >
+        {direction}
+      </div>
+
+      {strategyName && (
+        <div
+          className={`absolute left-1/2 top-3 inline-flex -translate-x-1/2 items-center gap-1 rounded-md border px-2.5 py-0.5 text-[11px] font-semibold ${
+            strategyBadgeClass || ''
+          }`}
+          style={strategyAccentColor ? {
+            backgroundColor: `${strategyAccentColor}18`,
+            color: strategyAccentColor,
+            borderColor: `${strategyAccentColor}55`,
+          } : undefined}
+        >
+          <span>{strategyName}</span>
+        </div>
+      )}
+
+      {/* Now price label remains anchored to the live marker. */}
       <div className="relative h-14 mb-1">
-        {/* SL label */}
+        {/* Now label */}
         <div
-          className="absolute -translate-x-1/2 text-center transition-[left] duration-500 ease-out"
-          style={{ left: `${slPercent}%` }}
-        >
-          <div className="text-[10px] font-semibold tracking-wide text-neutral-400 uppercase">SL</div>
-          <div className="text-[13px] font-bold font-mono text-rose-400 leading-tight">{slDisplay}</div>
-        </div>
-
-        {/* Entry label */}
-        <div
-          className="absolute -translate-x-1/2 text-center transition-[left] duration-500 ease-out"
-          style={{ left: `${entryPercent}%` }}
-        >
-          <div className="text-[10px] font-semibold tracking-wide text-neutral-400 uppercase">Entry</div>
-          <div className="text-[13px] font-bold font-mono text-white leading-tight">{entryDisplay}</div>
-        </div>
-
-        {/* Now label — vertically offset when too close to Entry or SL/TP to avoid overlap */}
-        <div
-          className="absolute -translate-x-1/2 text-center transition-[left,top] duration-500 ease-out"
+          className="absolute right-0 text-right"
           style={{
-            left: `${nowPercent}%`,
-            top: (Math.abs(nowPercent - entryPercent) < 10 || Math.abs(nowPercent - slPercent) < 10 || Math.abs(nowPercent - tpPercent) < 10) ? '28px' : '0px',
+            top: '0px',
           }}
         >
-          <div className="text-[10px] font-semibold tracking-wide text-neutral-400 uppercase">Now</div>
+          <div className="text-[10px] font-semibold tracking-wide text-neutral-400 uppercase">Price</div>
           <div
             className="text-[13px] font-bold font-mono leading-tight transition-colors duration-300"
             style={{ color: dotColor, textShadow: tickPulse ? `0 0 8px ${dotGlow}` : 'none' }}
@@ -248,14 +260,26 @@ export const PositionProgressBar: React.FC<PositionProgressBarProps> = ({
           </div>
         </div>
 
-        {/* TP label */}
+        {/* Compact SL, Entry, and TP markers directly above the track. */}
         <div
-          className="absolute -translate-x-1/2 text-center transition-[left] duration-500 ease-out"
-          style={{ left: `${tpPercent}%` }}
+          className="absolute -translate-x-1/2 rounded-md border border-rose-500/30 bg-rose-500/15 px-2 py-0.5 text-[10px] font-bold tracking-wide text-rose-300"
+          style={{ left: `${slPercent}%`, top: '32px' }}
         >
-          <div className="text-[10px] font-semibold tracking-wide text-neutral-400 uppercase">TP</div>
-          <div className="text-[13px] font-bold font-mono text-emerald-400 leading-tight">{tpDisplay}</div>
+          SL
         </div>
+        <div
+          className="absolute -translate-x-1/2 rounded-md border border-white/25 bg-white/10 px-2 py-0.5 text-[10px] font-bold tracking-wide text-white"
+          style={{ left: `${entryPercent}%`, top: '32px' }}
+        >
+          Entry
+        </div>
+        <div
+          className="absolute -translate-x-1/2 rounded-md border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold tracking-wide text-emerald-300"
+          style={{ left: `${tpPercent}%`, top: '32px' }}
+        >
+          TP
+        </div>
+
       </div>
 
       {/* Bar track */}
@@ -354,14 +378,36 @@ export const PositionProgressBar: React.FC<PositionProgressBarProps> = ({
             />
           </div>
         </div>
+
+        {isClosed && (
+          <div
+            className="absolute top-1/2 z-10 -translate-x-1/2 -translate-y-1/2 animate-pulse"
+            style={{ left: `${closePercent}%` }}
+            data-testid={isClosedProfit ? 'progress-close-profit' : 'progress-close-loss'}
+          >
+            {isClosedProfit ? (
+              <CheckCircle2
+                className="h-6 w-6 animate-bounce text-emerald-400"
+                strokeWidth={3}
+                style={{ filter: 'drop-shadow(0 0 6px rgba(34,197,94,0.85))' }}
+              />
+            ) : (
+              <XCircle
+                className="h-6 w-6 animate-bounce text-rose-400"
+                strokeWidth={3}
+                style={{ filter: 'drop-shadow(0 0 6px rgba(244,63,94,0.85))' }}
+              />
+            )}
+          </div>
+        )}
       </div>
 
-      {/* Floating "XX% Position" badge under NOW */}
+      {/* Keep the position badge centered so live price movement cannot move it. */}
       <div
-        className="absolute transition-[left] duration-500 ease-out"
+        className="absolute"
         style={{
-          left: `${nowPercent}%`,
-          top: 'calc(100% - 22px)',
+          left: '50%',
+          top: 'calc(100% - 19px)',
           transform: 'translateX(-50%)',
         }}
         data-testid="progress-position-badge"
@@ -369,17 +415,17 @@ export const PositionProgressBar: React.FC<PositionProgressBarProps> = ({
         <div className="relative">
           {/* Little connector line to the dot */}
           <div
-            className="absolute left-1/2 -translate-x-1/2 -top-2 w-[2px] h-2 opacity-60"
+            className="absolute left-1/2 -translate-x-1/2 -top-1.5 w-px h-1.5 opacity-50"
             style={{ background: dotColor }}
           />
           <div
-            className="px-2.5 py-[3px] rounded-md text-[11px] font-bold font-mono whitespace-nowrap"
+            className="rounded-md px-2 py-0.5 text-[10px] font-bold leading-tight font-mono whitespace-nowrap"
             style={{
               background: isProfit
                 ? 'linear-gradient(180deg, rgba(34,197,94,0.9), rgba(22,163,74,0.9))'
                 : 'linear-gradient(180deg, rgba(244,63,94,0.9), rgba(225,29,72,0.9))',
               color: '#04120a',
-              boxShadow: `0 4px 12px ${dotGlow}, inset 0 1px 0 rgba(255,255,255,0.35)`,
+              boxShadow: `0 2px 8px ${dotGlow}, inset 0 1px 0 rgba(255,255,255,0.3)`,
               border: `1px solid ${isProfit ? 'rgba(34,197,94,0.9)' : 'rgba(244,63,94,0.9)'}`,
             }}
           >

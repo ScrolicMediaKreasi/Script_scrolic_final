@@ -89,10 +89,8 @@ const DashboardLiveTradeItem: React.FC<DashboardLiveTradeItemProps> = ({ trade, 
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="font-bold text-white text-base font-display">{localTrade.symbol}</span>
-          <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase ${
-            isBuy ? 'bg-emerald-500/20 text-emerald-300' : 'bg-rose-500/20 text-rose-300'
-          }`}>
-            {localTrade.direction} {localTrade.volumeLot} Lot
+          <span className="px-2 py-0.5 rounded text-[10px] font-black uppercase text-neutral-400">
+            {localTrade.volumeLot} Lot
           </span>
         </div>
         <div className="text-right">

@@ -1,0 +1,106 @@
+{
+  "summary": "Iteration 4 dual-environment cTrader refactor verification (backend + frontend). The refactor itself is SOUND: both live and demo clients boot, connect over separate persistent WebSockets and authenticate at Spotware; the boot log contains '[cTrader.Client] Dual-env clients ready: main=live, alt=demo'; /api/ctrader/connection/status exposes environments.live.state=AUTHENTICATED AND environments.demo.state=AUTHENTICATED; /api/ctrader/diagnostics returns diagnostics.host=live.ctraderapi.com AND diagnosticsAlt.host=demo.ctraderapi.com. No circular imports, no boot errors, and all @ptsmiea baseline numbers are UNCHANGED (191 trades, winRate 49.2, realizedPnL -1117.30). Frontend feed renders 8 position-progress-bar elements and the socket.io WebSocket upgrades to HTTP 101 and joins the user room when a session exists. Dashboard Portfolio regression passes exactly ('Portofolio (191)' + 'Halaman 1 / 10 - 1-20 dari 191'). HOWEVER the headline user-facing goal (real-time price/pips/profit movement on live AND demo) could NOT be verified and is currently non-functional in this environment: there is NO cTrader OAuth broker session left in MongoDB (all 3 users have ctrader_connected=false, ctrader_access_token=null, ctrader_accounts=[]), so zero trading accounts are re-authenticated on either client, zero symbols get subscribed, and every feed post is a CLOSED deal. Additionally no admin user exists in the DB at all, so the @Master_Reverdal admin+DEMO path is entirely unexercised. New tests: 28 passed / 1 skipped. Full backend suite: 78 passed / 7 failed (5 of the 7 are stale iteration-1 shard tests, config drifted to CTRADER_SHARD_COUNT=1).",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "startup restore (server.py on_startup L290-323) + /api/ctrader/token/status",
+        "issue": "No broker account is re-authenticated on boot on EITHER client. db_store.users has 3 users, all with ctrader_connected=false / ctrader_access_token=null / ctrader_accounts=[], so live_tasks and demo_tasks are both empty and the new '[cTrader.Restore] Scheduled N live + M demo' log line has NEVER been emitted (grep count = 0 across the whole backend log). Consequence: connection/status authenticated_accounts=[] and environments.live.accounts=0, environments.demo.accounts=0 -> ticker.subscribe_symbol() has nothing to resolve -> no ProtoOASpotEvent ever arrives -> price/pips/profitUSD cannot move on live OR demo. The dual-env architecture is correct but has zero live data flowing through it.",
+        "priority": "CRITICAL"
+      },
+      {
+        "endpoint": "OAuth session persistence (server.py L993 ensure_valid_ctrader_token)",
+        "issue": "Root cause candidate: when the access token expires and no ctrader_refresh_token is stored, the code silently does update_user({'ctrader_connected': False}) and returns False. Combined with /api/ctrader/token/status now reporting hasAccessToken=false/hasRefreshToken=false while still returning expiresAt=2026-10-01, @ptsmiea's session was wiped with no user-visible error and no recovery path. Needs re-connect of the broker account (and a refresh-token persistence fix) before realtime can be validated at all.",
+        "priority": "CRITICAL"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "/api/feed",
+        "issue": "Data consistency: for many XAUUSD CLOSED posts profitUSD does not match lot x price move derived from entryPrice/currentPrice (e.g. 0.01 lot move -4.42 -> profitUSD -8.96 (~2x); 0.1 lot move -2.27 -> profitUSD -233.00 (~10x)). Means currentPrice on closed posts is not the actual close price, so the PositionProgressBar NOW marker position disagrees with the P/L shown on the same card. Fails tests/test_ptsmiea_ctrader.py::TestFeedNumbers::test_profit_consistent_with_lot_and_pips."
+      },
+      {
+        "endpoint": "/api/ctrader/shards/status",
+        "issue": "CTraderClient has no get_shards_summary(), so with CTRADER_SHARD_COUNT=1 the endpoint falls into the synthetic branch and returns shardCount=1 with authScheduler={} and mongoWriter={} (empty observability), and the shard_assignments collection holds 0 lease docs. 5 stale iteration-1 tests in tests/test_ctrader_shards.py expect 8 shards + populated authScheduler/mongoWriter. Decide whether sharding is retired (then delete those tests) or restore the metrics."
+      },
+      {
+        "endpoint": "/api/users/ptsmiea/open-positions, /api/ctrader/accounts",
+        "issue": "Both return 404 Not Found (routes do not exist). Not a regression, but worth confirming the frontend does not call them."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "PositionProgressBar",
+        "issue": "No literal 'NOW' label is rendered. Reference layout in the request expects SL/Entry/NOW/TP; actual DOM renders SL (8), Entry (16), TP (8) and 'PRICE 4083.23' in place of NOW (0 occurrences). The floating '% Position' badge with glow IS present on all 8 cards and looks correct. Cosmetic deviation from the reference only.",
+        "selector": "[data-testid=\"position-progress-bar\"]",
+        "priority": "LOW"
+      },
+      {
+        "component": "DashboardView portfolio list",
+        "issue": "Portfolio rows use a dynamic per-trade testid (data-testid=`portfolio-trade-${t.id}`) with no stable container/row-class testid, so automation cannot count rows generically. 20 rows do render correctly (verified visually).",
+        "selector": "[data-testid^=\"portfolio-trade-\"]",
+        "priority": "LOW"
+      }
+    ],
+    "integration_issues": [
+      {
+        "flow": "Realtime tick -> feed card re-render",
+        "issue": "UNVERIFIABLE / currently dead end-to-end. (a) No broker account authenticated on either env so no spot events are produced at all; (b) DynamicFeedTemplate only subscribes to livePositionStore when (rawTrade.status === 'OPEN' && isIntersecting) (L181-214) and all 8 feed posts are status=CLOSED, so even if ticks arrived no card would update. Captured 2 samples 3s and 6s apart on the first card: bar text identical both times ('SELL / PRICE 4083.23 / -0.20% Position'). Socket transport itself is healthy: wss://.../socket.io/?EIO=4&transport=websocket opened, frames = handshake sid, 40{\"userId\":\"user-ptsmiea\"}, 40 ack, 42[\"join:user_room\"], and console logged '[SocketClient] Connected ...'.",
+        "affected_selectors": ["[data-testid=\"position-progress-bar\"]"]
+      },
+      {
+        "flow": "Anonymous / public preview feed",
+        "issue": "socketClient.connect() is only called when currentUser?.id is truthy (App.tsx L429-436), so a public visitor gets NO socket.io connection at all (only the CRA HMR socket wss://.../?token=... was observed). Public feed therefore never receives live updates. Confirm this is intended.",
+        "affected_selectors": []
+      }
+    ],
+    "design_issues": [
+      {
+        "screen": "Feed (1920x1080 desktop)",
+        "issues": [
+          "Content column is centered at roughly mobile width (~365px) on a 1920px desktop viewport, leaving very large empty gutters both sides; no desktop/tablet layout.",
+          "Story rail at the top is horizontally clipped mid-avatar at the right edge of the narrow column with no visible scroll affordance.",
+          "The 'Install Scrolic App' toast overlaps the bottom-right area persistently and has no auto-dismiss."
+        ]
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_dual_env_ctrader.py",
+    "/app/backend/tests/test_dual_env_routing_unit.py",
+    "/app/test_reports/pytest/iter4_dual_env.xml",
+    "/app/test_reports/pytest/iter4_full.xml"
+  ],
+  "action_items": [
+    "CRITICAL: Re-establish a cTrader OAuth broker session for @ptsmiea (and persist ctrader_refresh_token) so accounts get re-authenticated on boot. Until then environments.live.accounts=0 / environments.demo.accounts=0 and NO realtime price movement is possible on either env — the primary user request cannot be delivered or verified.",
+    "CRITICAL: Fix the silent session wipe in ensure_valid_ctrader_token (server.py L993) — it sets ctrader_connected=False with no refresh-token fallback, no log and no user-facing error.",
+    "Seed/create an admin user (e.g. @Master_Reverdal) with a DEMO account so the admin+DEMO env-routing path can actually be exercised end-to-end; today all 3 DB users have role='user' and the demo client has zero accounts.",
+    "Add a log line when restore produces 0 tasks (e.g. '[cTrader.Restore] No stored broker sessions to restore') — the current silence made a total restore failure look like a healthy boot.",
+    "Fix /api/feed currentPrice for CLOSED deals so profitUSD is consistent with lot x price move (bar NOW marker currently disagrees with the card P/L).",
+    "Decide on sharding: either restore get_shards_summary/authScheduler/mongoWriter metrics or delete the 5 stale tests in tests/test_ctrader_shards.py (config is now CTRADER_SHARD_COUNT=1).",
+    "Optional: render the literal 'NOW' label on PositionProgressBar to match the reference design."
+  ],
+  "critical_code_review_comments": [
+    "ctrader_client.py L1195-1212: when CTRADER_SHARD_COUNT>1, ctrader_client becomes a ShardManager built WITHOUT an env argument while ctrader_client_alt is always a plain single CTraderClient — the dual-env design is asymmetric and untested in sharded mode. ShardManager also exposes account_states/account_to_user_map as @property, which the new find_account_state/find_user_for_account helpers read via getattr(c,'account_states',{}); that happens to work but resolve_client_for_env compares getattr(ctrader_client,'_env',_MAIN_ENV) and ShardManager has no _env, so it silently relies on the default. Add an explicit env param to ShardManager and a test for shard_count>1.",
+    "ctrader_config.get_ctrader_env() defaults to 'demo' when CTRADER_ENVIRONMENT is unset — this silently FLIPS main/alt clients (reproduced: importing ctrader_client without loading /app/backend/.env yields main=demo, alt=live). Make the env explicit/required or default to 'live' so a missing var cannot invert live and demo routing.",
+    "server.py on_startup L290-323 iterates db_store.users only; there is no verification that the restore actually authenticated anything and no log on the zero-task path, which is exactly how the current total restore failure went unnoticed.",
+    "server.py is 4047 lines — well over the 700-line guideline; split the cTrader routes, feed routes and auth routes into separate routers.",
+    "server.py L1825-1866: the /api/ctrader/shards/status fallback returns authScheduler={} and mongoWriter={} instead of a 501/explicit 'sharding disabled' marker, so a dead observability path looks like a successful 200 response."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_dual_env_ctrader.py",
+    "/app/backend/tests/test_dual_env_routing_unit.py"
+  ],
+  "success_rate": {"backend": "92% (78/85 full suite; 28/28 new dual-env tests pass, 1 skipped)", "frontend": "70% (feed load, progress bars, socket.io 101 upgrade, dashboard portfolio pass; realtime tick re-render unverifiable)"},
+  "seed_data_creation": "None. No trades placed, no cTrader account connected, no user modified — architecture verification only, as instructed. Two new read-only/unit test files added.",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "UI: cookie scrolic_uid=user-ptsmiea (domain scrolic-preview-1.preview.emergentagent.com) + init script localStorage scrolic_user_id=user-ptsmiea set BEFORE page.goto. API: header 'x-session-user-id: user-ptsmiea'. NOTE: /app/memory/test_credentials.md is now STALE — it claims ctrader_connected=true with accounts 48005582/48144800, but MongoDB shows ctrader_connected=false and ctrader_accounts=[] for all 3 users. No admin credentials exist in the DB.",
+  "context_for_next_testing_agent": "CONFIRMED PASSING (do not re-litigate): dual-env boot log '[cTrader.Client] Dual-env clients ready: main=live, alt=demo'; /api/ctrader/connection/status environments.live.state and environments.demo.state both AUTHENTICATED (sampled 5x over 20s, stable); /api/ctrader/diagnostics diagnostics.host=live.ctraderapi.com + diagnosticsAlt.host=demo.ctraderapi.com, both state AUTHENTICATED; /api/health database='connected (Python MemoryStore / MongoDB)' (note: NOT the bare string 'connected' — assert startswith) and mayar_configured=true; closed-trades pagination.total=191, aggregate.winRate=49.2, aggregate.totalProfitUSD=-1117.30; performance payload is nested at performance.summary.totalTrades=191 / performance.summary.realizedPnL=-1117.30 (NOT top-level); /api/feed returns 8 posts under key 'posts' with all fields nested under post['trade'] (symbol/pips/profitUSD/currentPrice) — all non-zero, no _id leakage anywhere; Dashboard Portfolio tab (testid dashboard-tab-portfolio) shows 'Portofolio (191)' and 'Halaman 1 / 10 - 1-20 dari 191' with 20 rows; socket.io upgrades to websocket and emits 40{userId} + 42[join:user_room]. FLAKY: the two connection/status env-state assertions failed once during a backend hot-reload window (00:15:41 disconnect -> both clients re-AUTHENTICATED by 00:15:43, ~2s) — retry once before reporting; ~10% failure rate right after a reload. STILL BLOCKED: realtime price/pips/profit movement on both envs, and the whole admin+DEMO path — both need a real cTrader OAuth session and an admin user in the DB first; re-test those only after the main agent re-connects a broker account. Reusable regression files: /app/backend/tests/test_dual_env_ctrader.py (API) and /app/backend/tests/test_dual_env_routing_unit.py (pure routing unit tests — MUST load_dotenv('/app/backend/.env') before importing backend.ctrader_client or main/alt env inverts).",
+  "flaky_tests": [
+    {"test": "test_dual_env_ctrader.py::TestDualEnvStatus::test_connection_status_both_environments_authenticated", "failure_rate": "~10% (only within ~2s of a backend hot reload)"},
+    {"test": "test_dual_env_ctrader.py::TestDualEnvStatus::test_diagnostics_both_streams_connected", "failure_rate": "~10% (only within ~2s of a backend hot reload)"}
+  ],
+  "rca_of_the_issue": "The dual-env refactor is not the cause of the realtime failure. Root cause of 'prices do not move': there is no persisted cTrader OAuth session in MongoDB. All three user documents (user-ptsmiea, user-mr_sofyan51, user-test_qa_1788359938) have ctrader_connected=false, ctrader_access_token=null and ctrader_accounts=[]. Reproduction: (1) query users collection -> no user has a token; (2) GET /api/ctrader/token/status -> isConnected=false, hasAccessToken=false, hasRefreshToken=false; (3) grep '[cTrader.Restore]' in /var/log/supervisor/backend.err.log -> 0 hits, i.e. the new restore code produced zero tasks; (4) the last ProtoOAAccountAuthRes lines in the log are dated 2026-08-31, none in the current 2026-09-03 boot; (5) GET /api/ctrader/connection/status -> authenticated_accounts=[] and both environments report accounts=0; (6) POST /api/ctrader/switch with 48005582 -> 400 ACCOUNT_NOT_AUTHORIZED. Because no account is authenticated, ticker never issues a spot subscription, so ProtoOASpotEvent never fires and livePositionStore.dispatchUpdate is never called; the UI is correct but starved of input. The likely trigger is server.py L993: on token expiry with no stored refresh token the code silently sets ctrader_connected=False and returns False, permanently dropping the session. Mitigation: persist ctrader_refresh_token on OAuth callback, re-run the OAuth connect for @ptsmiea, add an explicit warning log plus a zero-task restore log, then re-run the realtime verification for both live and demo (and seed an admin user with a DEMO account for the @Master_Reverdal path)."
+}

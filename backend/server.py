@@ -241,23 +241,43 @@ active_session_user_id: Optional[str] = None
 @fastapi_app.on_event("startup")
 async def on_startup():
     await init_db()
+    # Import dual-client helpers
+    try:
+        from backend.ctrader_client import ctrader_client_alt, all_ctrader_clients, register_event_listener_on_all, resolve_client_for_user_account
+    except ImportError:
+        from ctrader_client import ctrader_client_alt, all_ctrader_clients, register_event_listener_on_all, resolve_client_for_user_account
+
     if HAS_SOCKETIO and sio is not None:
         live_trading_service.set_sio(sio)
         
         def _on_client_lifecycle_event(evt_name, data):
-            diag = ctrader_client.get_diagnostics()
-            payload = event_contract_manager.build_connection_status_payload(diag)
+            # Merge diagnostics from BOTH clients so frontend sees combined state (live+demo)
+            live_diag = ctrader_client.get_diagnostics()
+            alt_diag = ctrader_client_alt.get_diagnostics()
+            # Prefer AUTHENTICATED, else CONNECTED, else the primary
+            def _state_rank(d):
+                s = str(d.get("state") or "").upper()
+                return {"AUTHENTICATED": 3, "CONNECTED": 2, "CONNECTING": 1}.get(s, 0)
+            merged = live_diag if _state_rank(live_diag) >= _state_rank(alt_diag) else alt_diag
+            merged = dict(merged)
+            merged["environments"] = {
+                "live": {"state": live_diag.get("state"), "accounts": live_diag.get("authenticated_accounts_count", 0)},
+                "demo": {"state": alt_diag.get("state"), "accounts": alt_diag.get("authenticated_accounts_count", 0)},
+            }
+            payload = event_contract_manager.build_connection_status_payload(merged)
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 loop.create_task(sio.emit("connection:status_update", payload))
                 loop.create_task(sio.emit("ctrader:connection_update", payload))
 
-        ctrader_client.register_event_listener(_on_client_lifecycle_event)
+        register_event_listener_on_all(_on_client_lifecycle_event)
 
         # ticker.py owns cTrader persistence handlers; server only exposes routes and transport events.
 
     live_trading_service.start(2.5)
-    await ctrader_client.start()
+    # Start BOTH live+demo clients in parallel
+    for _c in all_ctrader_clients():
+        await _c.start()
     # Boot the debounced Mongo writer AFTER init_db but BEFORE the auth burst.
     try:
         from backend.mongo_writer import get_mongo_writer
@@ -267,49 +287,57 @@ async def on_startup():
     await _mongo_writer.start()
     token_refresh_supervisor.start()
 
-    # Restore every previously authorised broker account via the rate-limited shard scheduler.
-    restore_tasks: List[Dict[str, Any]] = []
-    active_env = (CTRADER_ENV or "demo").lower()
+    # Restore every previously authorised broker account — dispatch to correct env client
+    live_tasks: List[Dict[str, Any]] = []
+    demo_tasks: List[Dict[str, Any]] = []
     for stored_user in list(db_store.users):
         if not stored_user.get("ctrader_connected") or not stored_user.get("ctrader_access_token"):
             continue
         user_id = stored_user.get("id") or stored_user.get("username")
         for account in stored_user.get("ctrader_accounts") or []:
             account_id = account.get("accountId") if isinstance(account, dict) else account
-            account_type = str(account.get("accountType", "")).upper() if isinstance(account, dict) else ""
-            account_is_live = account.get("isLive") if isinstance(account, dict) else None
-            
-            # Determine explicit account environment
-            if account_type == "DEMO" or account_is_live is False:
-                acct_env = "demo"
-            elif account_type == "LIVE" or account_is_live is True:
-                acct_env = "live"
+            if not account_id:
+                continue
+            target_client = resolve_client_for_user_account(stored_user, account if isinstance(account, dict) else {})
+            task = {
+                "account_id": account_id,
+                "access_token": stored_user["ctrader_access_token"],
+                "user_id": user_id,
+            }
+            if target_client is ctrader_client_alt:
+                demo_tasks.append(task)
             else:
-                acct_env = active_env
+                live_tasks.append(task)
 
-            environment_matches = (acct_env == active_env)
-
-            if account_id and environment_matches:
-                restore_tasks.append({
-                    "account_id": account_id,
-                    "access_token": stored_user["ctrader_access_token"],
-                    "user_id": user_id,
-                })
-            elif account_id:
-                logger.info(f"[cTrader.Restore] Skipping account {account_id} restore: account env '{acct_env}' does not match server active env '{active_env}'.")
-    if restore_tasks and hasattr(ctrader_client, "authenticate_all_accounts_ratelimited"):
-        asyncio.create_task(ctrader_client.authenticate_all_accounts_ratelimited(restore_tasks))
-        logger.info(f"[cTrader.Restore] Scheduled {len(restore_tasks)} account re-auth via rate-limited shard scheduler.")
-    elif restore_tasks:
-        # Single-shard fallback (should not happen once ShardManager is active).
-        for t in restore_tasks:
-            await ctrader_client.authenticate_account(t["account_id"], t["access_token"], t["user_id"])
+    async def _dispatch_restore(client_ref, tasks):
+        if not tasks:
+            return
+        if hasattr(client_ref, "authenticate_all_accounts_ratelimited"):
+            asyncio.create_task(client_ref.authenticate_all_accounts_ratelimited(tasks))
+        else:
+            for t in tasks:
+                await client_ref.authenticate_account(t["account_id"], t["access_token"], t["user_id"])
+    await _dispatch_restore(ctrader_client, live_tasks)
+    await _dispatch_restore(ctrader_client_alt, demo_tasks)
+    if live_tasks or demo_tasks:
+        logger.info(f"[cTrader.Restore] Scheduled {len(live_tasks)} live + {len(demo_tasks)} demo account re-auth via dual-env clients.")
+    else:
+        logger.warning(
+            "[cTrader.Restore] No stored broker sessions to restore (0 users have ctrader_connected=true + ctrader_access_token). "
+            "Real-time price/pips/profit updates require an active cTrader OAuth session. "
+            "Direct users to /api/ctrader/auth-url to (re)connect their broker account."
+        )
     logger.info(f"[scrolic.backend] Single-runtime FastAPI backend running. Mayar API Key configured: {bool(get_mayar_api_key())}")
 
 @fastapi_app.on_event("shutdown")
 async def on_shutdown():
     live_trading_service.stop()
-    await ctrader_client.stop()
+    try:
+        from backend.ctrader_client import all_ctrader_clients
+    except ImportError:
+        from ctrader_client import all_ctrader_clients
+    for _c in all_ctrader_clients():
+        await _c.stop()
     try:
         from backend.mongo_writer import get_mongo_writer
     except ImportError:
@@ -325,7 +353,16 @@ def get_current_user_id(request: Request, x_session_user_id: Optional[str] = Hea
 
 def format_post(post: Dict[str, Any], current_user_id: Optional[str] = None) -> Dict[str, Any]:
     author = db_store.find_user_by_id_or_username(post.get("user_id", "")) or db_store.find_user_by_username(post.get("username", "")) or {}
-    strategy = db_store.find_strategy_by_id(post.get("strategy_id", "breakout")) or SEED_STRATEGIES[0]
+    strategy_id = (
+        post.get("strategy_id")
+        or post.get("strategyId")
+        or author.get("strategy_dna")
+        or author.get("primary_strategy_id")
+        or author.get("strategyDNA")
+        or author.get("primaryStrategyId")
+        or "breakout"
+    )
+    strategy = db_store.find_strategy_by_id(strategy_id) or SEED_STRATEGIES[0]
     curr_user = db_store.find_user_by_id_or_username(current_user_id) if current_user_id else None
 
     created_at = post.get("created_at")
@@ -375,7 +412,7 @@ def format_post(post: Dict[str, Any], current_user_id: Optional[str] = None) -> 
             "openTime": opened_at_str,
             "duration": post.get("duration", "Live"),
             "status": post.get("status", "OPEN"),
-            "strategyId": post.get("strategy_id", "breakout")
+            "strategyId": strategy_id
         },
         "strategy": {
             "id": strategy.get("id"),
@@ -959,7 +996,20 @@ async def ensure_valid_ctrader_token(user_id: str) -> bool:
     if isinstance(expires_at, datetime) and expires_at < now:
         refresh_token = user.get("ctrader_refresh_token")
         if not refresh_token:
-            db_store.update_user(user.get("id") or user.get("username"), {"ctrader_connected": False})
+            # Token expired AND no refresh_token available. Log clearly instead of silently wiping.
+            # Do NOT set ctrader_connected=False here — that permanently drops the session with no
+            # user-facing signal. Instead, mark it as requiring re-auth so the frontend can show
+            # a "Re-connect broker" CTA while keeping the accounts list visible.
+            logger.warning(
+                f"[cTrader.Token] Access token expired for user={user.get('username')} at {expires_at.isoformat()} "
+                f"and no refresh_token is stored. Marking session as REAUTH_REQUIRED. "
+                f"User must go through /api/ctrader/auth-url to obtain a fresh access+refresh token."
+            )
+            db_store.update_user(user.get("id") or user.get("username"), {
+                "ctrader_reauth_required": True,
+                "ctrader_reauth_reason": "TOKEN_EXPIRED_NO_REFRESH",
+                "ctrader_reauth_at": now
+            })
             return False
         return await refresh_user_token(user_id)
     return True
@@ -1238,6 +1288,10 @@ def calculate_ctrader_lots(raw_volume: Any, symbol: str = "XAUUSD") -> float:
 
 async def sync_ctrader_account_trades(user_id: str) -> dict:
     from backend.ticker import normalize_money_value, normalize_volume_lots, symbol_registry
+    try:
+        from backend.ctrader_client import resolve_client_for_user_account, find_client_by_account
+    except ImportError:
+        from ctrader_client import resolve_client_for_user_account, find_client_by_account
 
     user = db_store.find_user_by_id_or_username(user_id)
     if not user:
@@ -1250,14 +1304,22 @@ async def sync_ctrader_account_trades(user_id: str) -> dict:
     if not access_token or not account_id:
         return {"synced": False, "reason": "cTrader account is not authenticated"}
 
-    acct_num = ctrader_client._clean_numeric_account_id(account_id)
-    account_state = ctrader_client.account_states.get(acct_num, {})
+    # Determine which env client owns this account (based on user role + account type)
+    active_account_obj = next(
+        (a for a in (user.get("ctrader_accounts") or []) if str(a.get("accountId")) == str(account_id)),
+        {}
+    )
+    target_client = find_client_by_account(ctrader_client._clean_numeric_account_id(account_id)) \
+        or resolve_client_for_user_account(user, active_account_obj)
+
+    acct_num = target_client._clean_numeric_account_id(account_id)
+    account_state = target_client.account_states.get(acct_num, {})
     if account_state.get("authStatus") != "AUTHENTICATED":
-        if not await ctrader_client.authenticate_account(account_id, access_token, user_uid):
+        if not await target_client.authenticate_account(account_id, access_token, user_uid):
             return {"synced": False, "reason": "cTrader account authentication failed"}
 
     now_ms = int(time.time() * 1000)
-    snapshot = await ctrader_client.request_snapshot(
+    snapshot = await target_client.request_snapshot(
         acct_num,
         now_ms - (365 * 24 * 3600 * 1000),
         now_ms
@@ -1540,9 +1602,16 @@ async def ctrader_connect(request: Request, x_session_user_id: Optional[str] = H
         updates["ctrader_access_token"] = body["accessToken"]
         updates["ctrader_token_expires_at"] = datetime.now(timezone.utc) + timedelta(days=30)
 
-    account_authenticated = await ctrader_client.authenticate_account(primary_id, access_token, curr_id)
+    # Dual-env dispatch: pick the right client based on the primary account's env + user role
+    try:
+        from backend.ctrader_client import resolve_client_for_user_account
+    except ImportError:
+        from ctrader_client import resolve_client_for_user_account
+    primary_account_obj = next((a for a in accounts if str(a.get("accountId")) == str(primary_id)), accounts[0] if accounts else {})
+    target_client = resolve_client_for_user_account(user, primary_account_obj)
+    account_authenticated = await target_client.authenticate_account(primary_id, access_token, curr_id)
     if not account_authenticated:
-        auth_error = ctrader_client.get_account_status(primary_id).get("lastError") or "Akun cTrader gagal diautentikasi ke Open API."
+        auth_error = target_client.get_account_status(primary_id).get("lastError") or "Akun cTrader gagal diautentikasi ke Open API."
         if str(auth_error).startswith("WARNING:"):
             raise HTTPException(409, auth_error)
         raise HTTPException(502, "ACCOUNT_AUTH_FAILED: Akun cTrader gagal diautentikasi ke Open API.")
@@ -1582,10 +1651,24 @@ async def ctrader_switch(request: Request, x_session_user_id: Optional[str] = He
     if not access_token:
         raise HTTPException(401, "CTRADER_REAUTH_REQUIRED: Access token cTrader tidak tersedia. Hubungkan ulang akun melalui OAuth cTrader.")
 
-    # Trigger account switch & reconciliation on persistent client
-    switched = await ctrader_client.switch_account(old_acct_id, target_acct_id, access_token, curr_id)
+    # Trigger account switch & reconciliation on persistent client — dispatched to correct env
+    try:
+        from backend.ctrader_client import resolve_client_for_user_account, find_client_by_account
+    except ImportError:
+        from ctrader_client import resolve_client_for_user_account, find_client_by_account
+    target_client = resolve_client_for_user_account(user, target_acct)
+    # Also unbind from old client if it lived on a different env
+    old_client = find_client_by_account(ctrader_client._clean_numeric_account_id(old_acct_id)) if old_acct_id else None
+    if old_client and old_client is not target_client:
+        try:
+            old_num = old_client._clean_numeric_account_id(old_acct_id)
+            old_client.account_tokens.pop(old_num, None)
+            old_client.account_to_user_map.pop(old_num, None)
+        except Exception:
+            pass
+    switched = await target_client.switch_account(old_acct_id, target_acct_id, access_token, curr_id)
     if not switched:
-        auth_error = ctrader_client.get_account_status(target_acct_id).get("lastError") or "Akun cTrader gagal diautentikasi ke Open API."
+        auth_error = target_client.get_account_status(target_acct_id).get("lastError") or "Akun cTrader gagal diautentikasi ke Open API."
         if str(auth_error).startswith("WARNING:"):
             raise HTTPException(409, auth_error)
         raise HTTPException(502, "ACCOUNT_AUTH_FAILED: Akun cTrader gagal diautentikasi ke Open API.")
@@ -1730,16 +1813,31 @@ async def ctrader_token_refresh(x_session_user_id: Optional[str] = Header(None))
 
 @fastapi_app.get("/api/ctrader/connection/status")
 async def ctrader_connection_status():
+    try:
+        from backend.ctrader_client import ctrader_client_alt
+    except ImportError:
+        from ctrader_client import ctrader_client_alt
+    live_diag = ctrader_client.get_diagnostics()
+    demo_diag = ctrader_client_alt.get_diagnostics()
     return {
         "success": True,
-        "connection": ctrader_client.get_diagnostics()
+        "connection": live_diag,
+        "environments": {
+            "live": {"state": live_diag.get("state"), "accounts": live_diag.get("authenticated_accounts_count", 0)},
+            "demo": {"state": demo_diag.get("state"), "accounts": demo_diag.get("authenticated_accounts_count", 0)}
+        }
     }
 
 @fastapi_app.get("/api/ctrader/diagnostics")
 async def ctrader_diagnostics():
+    try:
+        from backend.ctrader_client import ctrader_client_alt
+    except ImportError:
+        from ctrader_client import ctrader_client_alt
     return {
         "success": True,
         "diagnostics": ctrader_client.get_diagnostics(),
+        "diagnosticsAlt": ctrader_client_alt.get_diagnostics(),
         "alarms": ctrader_client.get_observability_alarms()
     }
 

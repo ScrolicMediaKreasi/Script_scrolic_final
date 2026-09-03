@@ -35,6 +35,7 @@ import { calculateCTraderPips } from '../utils/ctraderCalculations';
 import { triggerHaptic } from '../utils/haptics';
 import { updateSEOForFeedPost } from '../utils/seo';
 import { livePositionStore } from '../services/livePositionStore';
+import { getSymbolVisual } from '../utils/symbolVisuals';
 
 interface DynamicFeedTemplateProps {
   post: FeedPost;
@@ -53,23 +54,6 @@ interface DynamicFeedTemplateProps {
   onEditDescription?: (post: FeedPost) => void;
   onViewProfile?: (username: string) => void;
 }
-
-// Strategy icon mapper
-const StrategyIcon = ({ name = '', className }: { name?: string; className?: string }) => {
-  const n = (name || '').toLowerCase();
-  if (n.includes('breakout')) return <Zap className={className || 'w-3.5 h-3.5'} />;
-  if (n.includes('scalp')) return <Activity className={className || 'w-3.5 h-3.5'} />;
-  if (n.includes('swing')) return <TrendingUp className={className || 'w-3.5 h-3.5'} />;
-  if (n.includes('trend')) return <Compass className={className || 'w-3.5 h-3.5'} />;
-  if (n.includes('reversal')) return <Repeat className={className || 'w-3.5 h-3.5'} />;
-  if (n.includes('momentum')) return <Flame className={className || 'w-3.5 h-3.5'} />;
-  if (n.includes('support') || n.includes('snr')) return <Shield className={className || 'w-3.5 h-3.5'} />;
-  if (n.includes('price action')) return <BarChart2 className={className || 'w-3.5 h-3.5'} />;
-  if (n.includes('news')) return <Radio className={className || 'w-3.5 h-3.5'} />;
-  if (n.includes('position')) return <Anchor className={className || 'w-3.5 h-3.5'} />;
-  if (n.includes('smc') || n.includes('smart money')) return <Layers className={className || 'w-3.5 h-3.5'} />;
-  return <Sparkles className={className || 'w-3.5 h-3.5'} />;
-};
 
 export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
   post,
@@ -101,6 +85,15 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
 
   const avatarUrl = user.avatar && user.avatar.trim() !== '' ? user.avatar : DEFAULT_AVATAR;
 
+  const strategyId = String(
+    post.strategy?.id ||
+    post.strategy_id ||
+    (post as any).strategyId ||
+    post.trade?.strategyId ||
+    (post.user as any)?.primaryStrategyId ||
+    (post.user as any)?.strategyDNA ||
+    'breakout'
+  );
   const rawTrade = post.trade || {
     id: post.trade_id || post.id,
     cTraderPositionId: post.trade_id || post.id || 'pos-881',
@@ -119,10 +112,10 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
     openTime: post.opened_at || new Date().toISOString(),
     duration: post.duration || 'Live',
     status: post.status || 'OPEN',
-    strategyId: post.strategy_id || 'breakout'
+    strategyId
   };
 
-  const strategy = post.strategy || getStrategy(post.strategy_id || rawTrade.strategyId || 'breakout');
+  const strategy = getStrategy(strategyId);
   const defaultStrategyNote = strategy.defaultNote || strategy.description;
   const customDescription = post.customDescription || (post as any).custom_description;
   const autoDescription = post.autoDescription || (post as any).auto_description;
@@ -141,6 +134,8 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
 
   const displayProfitUSD = Number(localTrade.profitUSD ?? 0);
   const isPositiveProfit = displayProfitUSD >= 0;
+  const displaySymbol = trade?.symbol && trade.symbol !== 'Unknown' ? trade.symbol : 'XAUUSD';
+  const symbolVisual = getSymbolVisual(displaySymbol);
 
   // Sync server snapshots only when the underlying trade identity changes.
   // Otherwise the live tick state from the socket layer must remain the source of truth.
@@ -492,7 +487,7 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
           </div>
         </div>
 
-        {/* Status Badge & Dynamic Strategy Pill */}
+        {/* Status Badge */}
         <div className="flex flex-col items-end gap-1.5 shrink-0">
           <div className="flex items-center gap-1.5">
             {isOpen ? (
@@ -507,24 +502,6 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
             )}
           </div>
 
-          {/* Strategy DNA Badge with dynamic styling */}
-          <div 
-            className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-[11px] font-semibold border ${
-              isPremiumUser ? '' : strategy.badgeClass
-            }`}
-            style={
-              isPremiumUser 
-                ? { 
-                    backgroundColor: `${strategy.accentColor}18`, 
-                    color: strategy.accentColor, 
-                    borderColor: `${strategy.accentColor}55` 
-                  } 
-                : {}
-            }
-          >
-            <StrategyIcon name={strategy.name} />
-            <span>{strategy.name}</span>
-          </div>
         </div>
       </div>
 
@@ -534,16 +511,21 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
         {/* Symbol & Direction Bar */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
+            {symbolVisual?.kind === 'image' && (
+              <img
+                src={symbolVisual.src}
+                alt={symbolVisual.alt}
+                className="h-5 w-5 shrink-0 object-contain"
+              />
+            )}
+            {symbolVisual?.kind === 'flags' && (
+              <span className="inline-flex shrink-0 items-center gap-0.5 text-base leading-none" aria-label={`${displaySymbol} currencies`}>
+                <span>{symbolVisual.base}</span>
+                <span>{symbolVisual.quote}</span>
+              </span>
+            )}
             <span className="text-xl font-extrabold tracking-tight text-white font-display">
-              {trade?.symbol && trade.symbol !== 'Unknown' ? trade.symbol : 'XAUUSD'}
-            </span>
-            <span className={`inline-flex items-center gap-0.5 px-2.5 py-0.5 rounded-md text-xs font-black tracking-wider uppercase ${
-              isBuy 
-                ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30' 
-                : 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
-            }`}>
-              {isBuy ? <TrendingUp className="w-3.5 h-3.5 mr-0.5" /> : <TrendingDown className="w-3.5 h-3.5 mr-0.5" />}
-              {trade.direction}
+              {displaySymbol}
             </span>
           </div>
 
@@ -564,6 +546,9 @@ export const DynamicFeedTemplate: React.FC<DynamicFeedTemplateProps> = ({
             trade={localTrade} 
             isLocked={!isUnlocked} 
             strategyGradient={strategy.positionBarGradient} 
+            strategyName={strategy.name}
+            strategyAccentColor={isPremiumUser ? strategy.accentColor : undefined}
+            strategyBadgeClass={isPremiumUser ? undefined : strategy.badgeClass}
           />
         </div>
 

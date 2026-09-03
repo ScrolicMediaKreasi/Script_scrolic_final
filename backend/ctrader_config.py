@@ -15,9 +15,11 @@ import os
 from typing import Dict, Any
 
 # Environment configuration: demo or live
-CTRADER_ENV = os.environ.get("CTRADER_ENV", os.environ.get("CTRADER_ENVIRONMENT", "demo")).strip().lower()
+# Default to "live" so a missing env var doesn't silently invert the main/alt dual-env
+# routing (an unloaded /app/backend/.env used to make main=demo, alt=live).
+CTRADER_ENV = os.environ.get("CTRADER_ENV", os.environ.get("CTRADER_ENVIRONMENT", "live")).strip().lower()
 if CTRADER_ENV not in ("demo", "live"):
-    CTRADER_ENV = "demo"
+    CTRADER_ENV = "live"
 
 # Spotware Open API Server Endpoints
 SPOTWARE_ENDPOINTS = {

@@ -36,6 +36,12 @@ except ImportError:
 try:
     from backend.ctrader_client import (
         ctrader_client,
+        find_account_state,
+        find_user_for_account,
+        find_client_by_account,
+        all_authenticated_accounts,
+        merged_account_to_user_map,
+        merged_account_states,
         PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         PROTO_OA_SPOT_EVENT,
         PROTO_OA_EXECUTION_EVENT,
@@ -49,6 +55,12 @@ try:
 except ImportError:
     from ctrader_client import (
         ctrader_client,
+        find_account_state,
+        find_user_for_account,
+        find_client_by_account,
+        all_authenticated_accounts,
+        merged_account_to_user_map,
+        merged_account_states,
         PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         PROTO_OA_SPOT_EVENT,
         PROTO_OA_EXECUTION_EVENT,
@@ -258,32 +270,41 @@ class CTraderPositionService:
         self.processed_deal_ids: Set[str] = set()
         self.last_deal_cursor: Dict[int, int] = {}
 
-        # Hook into persistent ctrader_client handlers
-        ctrader_client.register_handler(PROTO_OA_SPOT_EVENT, self.handle_spot_event)
-        ctrader_client.register_handler(PROTO_OA_EXECUTION_EVENT, self.handle_execution_event)
-        ctrader_client.register_handler(PROTO_OA_SYMBOLS_LIST_RES, self.handle_symbols_list_event)
-        ctrader_client.register_handler(PROTO_OA_RECONCILE_RES, self.handle_reconcile_event)
-        ctrader_client.register_handler(PROTO_OA_TRADER_RES, self.handle_trader_event)
-        ctrader_client.register_handler(PROTO_OA_DEAL_LIST_RES, self.handle_deal_list_event)
-        ctrader_client.register_handler(PROTO_OA_MARGIN_CHANGED_EVENT, self.handle_margin_event)
-        ctrader_client.register_handler(PROTO_OA_GET_POSITION_UNREALIZED_PNL_RES, self.handle_unrealized_pnl_event)
+        # Hook into persistent ctrader_client handlers — register on BOTH live+demo clients
+        # so spot/execution/reconcile/deal events from either environment flow into the ticker.
+        try:
+            from ctrader_client import register_handler_on_all
+        except ImportError:
+            from backend.ctrader_client import register_handler_on_all
+        register_handler_on_all(PROTO_OA_SPOT_EVENT, self.handle_spot_event)
+        register_handler_on_all(PROTO_OA_EXECUTION_EVENT, self.handle_execution_event)
+        register_handler_on_all(PROTO_OA_SYMBOLS_LIST_RES, self.handle_symbols_list_event)
+        register_handler_on_all(PROTO_OA_RECONCILE_RES, self.handle_reconcile_event)
+        register_handler_on_all(PROTO_OA_TRADER_RES, self.handle_trader_event)
+        register_handler_on_all(PROTO_OA_DEAL_LIST_RES, self.handle_deal_list_event)
+        register_handler_on_all(PROTO_OA_MARGIN_CHANGED_EVENT, self.handle_margin_event)
+        register_handler_on_all(PROTO_OA_GET_POSITION_UNREALIZED_PNL_RES, self.handle_unrealized_pnl_event)
 
     def set_sio(self, sio_instance):
         self.sio = sio_instance
 
     def subscribe_symbol(self, ctid_account_id: int, symbol_id: int):
-        """Sends official ProtoOASubscribeSpotsReq (2104)."""
+        """Sends official ProtoOASubscribeSpotsReq (2104) via the correct env client."""
         if not symbol_id or symbol_id in self.subscribed_symbols:
             return
 
         target_acct_id = ctid_account_id
+        target_client = None
         if not target_acct_id:
-            # Resolve primary authenticated account ID from active states if account ID 0 passed
-            active_states = [acct for acct, s in ctrader_client.account_states.items() if s.get("authStatus") == "AUTHENTICATED"]
-            if active_states:
-                target_acct_id = active_states[0]
+            # Resolve primary authenticated account ID across BOTH clients
+            active = all_authenticated_accounts()
+            if active:
+                target_acct_id = active[0]
+                target_client = find_client_by_account(target_acct_id)
             else:
                 return
+        else:
+            target_client = find_client_by_account(target_acct_id) or ctrader_client
 
         self.subscribed_symbols.add(symbol_id)
         message = {
@@ -295,7 +316,7 @@ class CTraderPositionService:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(ctrader_client.send_message(PROTO_OA_SUBSCRIBE_SPOTS_REQ, message))
+        loop.create_task(target_client.send_message(PROTO_OA_SUBSCRIBE_SPOTS_REQ, message))
 
     def handle_symbols_list_event(self, event_data: Dict[str, Any]):
         """Registers the broker's account-specific symbol metadata catalog.
@@ -400,7 +421,7 @@ class CTraderPositionService:
         """
         try:
             acct_num = int(event_data.get("ctidTraderAccountId")) if event_data.get("ctidTraderAccountId") is not None else 0
-            user_id = ctrader_client.account_to_user_map.get(acct_num)
+            user_id = find_user_for_account(acct_num)
             if not user_id:
                 logger.warning(f"[cTrader.Reconcile] Unmapped account {acct_num}; refusing to write position data.")
                 ctrader_client.metrics["unmapped_events_count"] += 1
@@ -437,7 +458,7 @@ class CTraderPositionService:
                 tp = float(pos.get("takeProfit") or 0.0)
                 swap = float(pos.get("swap", 0.0))
                 commission = float(pos.get("commission", 0.0))
-                money_digits = int(ctrader_client.account_states.get(acct_num, {}).get("moneyDigits", 2))
+                money_digits = int(find_account_state(acct_num).get("moneyDigits", 2))
 
                 canonical_post_id = f"post-ctrader-{acct_num}-{pos_id}"
 
@@ -532,8 +553,8 @@ class CTraderPositionService:
             acct_num = int(trader.get("ctidTraderAccountId") or event_data.get("ctidTraderAccountId") or 0)
             if not acct_num:
                 return
-            account_state = ctrader_client.account_states.get(acct_num, {})
-            user_id = ctrader_client.account_to_user_map.get(acct_num) or account_state.get("userId")
+            account_state = find_account_state(acct_num)
+            user_id = find_user_for_account(acct_num) or account_state.get("userId")
             if user_id:
                 user = db_store.find_user_by_id_or_username(user_id)
                 if user:
@@ -555,7 +576,8 @@ class CTraderPositionService:
     def handle_margin_event(self, event_data: Dict[str, Any]):
         acct_num = int(event_data.get("ctidTraderAccountId") or 0)
         if acct_num:
-            ctrader_client.account_states.setdefault(acct_num, {}).update({
+            _client = find_client_by_account(acct_num) or ctrader_client
+            _client.account_states.setdefault(acct_num, {}).update({
                 "marginUpdatedAt": datetime.now(timezone.utc).isoformat(),
                 "marginEvent": event_data
             })
@@ -601,7 +623,7 @@ class CTraderPositionService:
                     post_id = f"post-ctrader-{acct_num}-{position_id}"
                     post = db_store.find_post_by_id(post_id)
                     if not post:
-                        user_id = ctrader_client.account_to_user_map.get(acct_num)
+                        user_id = find_user_for_account(acct_num)
                         user = db_store.find_user_by_id_or_username(user_id) if user_id else None
                         if not user:
                             ctrader_client.metrics["unmapped_events_count"] += 1
@@ -778,7 +800,7 @@ class CTraderPositionService:
                 realized_profit = float(deal.get("grossProfit") or deal.get("netProfit") or 0.0)
                 money_digits = int(
                     deal.get("moneyDigits")
-                    or ctrader_client.account_states.get(int(acct_num), {}).get("moneyDigits", 2)
+                    or find_account_state(int(acct_num)).get("moneyDigits", 2)
                 )
                 realized_profit = normalize_money_value(realized_profit, money_digits)
                 swap = normalize_money_value(deal.get("swap", 0.0), money_digits)
@@ -850,7 +872,7 @@ class CTraderPositionService:
                 sl = float(pos.get("stopLoss") or 0.0)
                 tp = float(pos.get("takeProfit") or 0.0)
 
-                user_id = ctrader_client.account_to_user_map.get(acct_num)
+                user_id = find_user_for_account(acct_num)
                 if not user_id:
                     logger.warning(f"[cTrader.Execution] Unmapped account {acct_num}; refusing to write execution data.")
                     ctrader_client.metrics["unmapped_events_count"] += 1
@@ -939,7 +961,7 @@ class CTraderPositionService:
             price_profit = (entry - current_ask) * units
 
         acct_num = ctrader_client._clean_numeric_account_id(post.get("account_id", ""))
-        account_state = ctrader_client.account_states.get(acct_num, {}) if acct_num else {}
+        account_state = find_account_state(acct_num) if acct_num else {}
         money_digits = int(account_state.get("moneyDigits", 2))
         swap = float(post.get("swap", 0.0) or 0.0)
         commission = float(post.get("commission", 0.0) or 0.0)
@@ -1006,7 +1028,7 @@ class CTraderPositionService:
         Realized Balance, Floating Equity, Margin, Free Margin, Margin Level, and Staleness.
         """
         acct_num = ctrader_client._clean_numeric_account_id(account_id)
-        acct_info = ctrader_client.account_states.get(acct_num, {}) if acct_num else {}
+        acct_info = find_account_state(acct_num) if acct_num else {}
         money_digits = int(acct_info.get("moneyDigits", 2))
         realized_balance = float(acct_info.get("balance", 0.0))
         leverage = float(acct_info.get("leverage", 500))
@@ -1097,7 +1119,7 @@ class CTraderPositionService:
             state = self.get_account_live_state(account_id)
             standard_acct_payload = event_contract_manager.build_account_metrics_payload(state)
             acct_num = ctrader_client._clean_numeric_account_id(account_id)
-            user_id = ctrader_client.account_to_user_map.get(acct_num)
+            user_id = find_user_for_account(acct_num)
 
             # Security Guard: Emit strictly to confidential private rooms
             if user_id:
@@ -1112,23 +1134,31 @@ class CTraderPositionService:
     async def _service_loop(self, interval_sec: float = 2.0):
         logger.info(f"[CTraderPositionService] Persistent Realtime Engine active ({interval_sec}s cycle).")
         cycle_count = 0
+        # Import here to avoid circular
+        try:
+            from ctrader_client import all_ctrader_clients
+        except ImportError:
+            from backend.ctrader_client import all_ctrader_clients
         while self._running:
             try:
                 cycle_count += 1
 
-                # Fallback Reconciliation: every 60 seconds (30 cycles)
-                if cycle_count % 30 == 0 and ctrader_client.state == "AUTHENTICATED":
-                    for acct_num in list(ctrader_client.account_states.keys()):
-                        if ctrader_client.is_account_authenticated(acct_num):
-                            logger.debug(f"[cTrader.Fallback] Periodic fallback sync for account {acct_num}")
-                            await ctrader_client.send_message(2121, {"ctidTraderAccountId": acct_num})  # PROTO_OA_TRADER_REQ
-                            await ctrader_client.send_message(2124, {"ctidTraderAccountId": acct_num})  # PROTO_OA_RECONCILE_REQ
-                            await self.emit_account_update(f"cTrader-{acct_num}")
+                # Iterate BOTH live+demo clients so admin demo accounts also get periodic fallback sync & P&L polling
+                for c in all_ctrader_clients():
+                    if str(c.state) != "AUTHENTICATED" and getattr(c.state, "value", None) != "AUTHENTICATED":
+                        continue
+                    # Fallback Reconciliation: every 60 seconds (30 cycles)
+                    if cycle_count % 30 == 0:
+                        for acct_num in list(c.account_states.keys()):
+                            if c.is_account_authenticated(acct_num):
+                                logger.debug(f"[cTrader.Fallback] Periodic fallback sync for account {acct_num} ({c._env})")
+                                await c.send_message(2121, {"ctidTraderAccountId": acct_num})  # PROTO_OA_TRADER_REQ
+                                await c.send_message(2124, {"ctidTraderAccountId": acct_num})  # PROTO_OA_RECONCILE_REQ
+                                await self.emit_account_update(f"cTrader-{acct_num}")
 
-                if ctrader_client.state == "AUTHENTICATED":
-                    for acct_num, account_state in list(ctrader_client.account_states.items()):
+                    for acct_num, account_state in list(c.account_states.items()):
                         if account_state.get("authStatus") == "AUTHENTICATED":
-                            await ctrader_client.request_position_unrealized_pnl(acct_num)
+                            await c.request_position_unrealized_pnl(acct_num)
 
             except Exception as exc:
                 logger.warning(f"[CTraderPositionService] Loop warning: {exc}")

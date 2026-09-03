@@ -84,10 +84,11 @@ PROTO_OA_GET_POSITION_UNREALIZED_PNL_REQ = 2187
 PROTO_OA_GET_POSITION_UNREALIZED_PNL_RES = 2188
 
 class CTraderClient:
-    def __init__(self, shard_id: int = 0, shard_count: int = 1):
+    def __init__(self, shard_id: int = 0, shard_count: int = 1, env: Optional[str] = None):
         self.shard_id: int = int(shard_id)
         self.shard_count: int = max(1, int(shard_count))
-        self._log_prefix: str = f"cTrader.Client.Shard{self.shard_id}" if self.shard_count > 1 else "cTrader.Client"
+        self._env: str = (env or get_ctrader_env() or "demo").lower()
+        self._log_prefix: str = f"cTrader.Client[{self._env}].Shard{self.shard_id}" if self.shard_count > 1 else f"cTrader.Client[{self._env}]"
         self.state: CTraderConnectionState = CTraderConnectionState.DISCONNECTED
         self._running: bool = False
         self._main_task: Optional[asyncio.Task] = None
@@ -131,7 +132,7 @@ class CTraderClient:
         self.metrics = {
             "state": self.state.value,
             "transport": self._transport_type,
-            "environment": get_ctrader_env(),
+            "environment": self._env,
             "host": "",
             "port": 0,
             "connected_at": None,
@@ -168,7 +169,7 @@ class CTraderClient:
             return default
 
     def _active_environment(self) -> str:
-        return self._environment_override or get_ctrader_env()
+        return self._environment_override or self._env or get_ctrader_env()
 
     def record_latency(self, broker_ts_ms: Optional[int]):
         """Tracks latency from broker event creation to local processing."""
@@ -590,35 +591,34 @@ class CTraderClient:
             self.account_to_user_map[acct_num] = user_id
         self.account_tokens[acct_num] = access_token
         
-        # Check if caller is Admin with a Demo account -> Dedicated Demo Route
+        # Determine target account environment (LIVE / DEMO)
         target_user = db_store.find_user_by_id_or_username(user_id or existing_owner or "")
         is_admin_user = str((target_user or {}).get("role", "")).lower() == "admin"
-        
         target_acct_obj = next(
             (a for a in (target_user or {}).get("ctrader_accounts", [])
              if self._clean_numeric_account_id(a.get("accountId") or a.get("accountNo")) == acct_num),
             None
         )
         is_demo_account = bool(
-            (target_acct_obj or {}).get("accountType") == "DEMO" 
+            (target_acct_obj or {}).get("accountType") == "DEMO"
             or (target_acct_obj or {}).get("isLive") is False
         )
+        account_env = "demo" if is_demo_account else "live"
 
-        account_env = "demo" if (is_admin_user and is_demo_account) or is_demo_account else get_ctrader_env()
+        # Guard: this client is bound to a single env; reject mismatched accounts so the
+        # caller can dispatch to the correct sibling client (see resolve_client_for_account()).
+        if account_env != self._env:
+            logger.info(
+                f"[cTrader.Dispatch] Account {acct_num} is {account_env} but this client is bound to {self._env}. "
+                f"Skipping auth on wrong-env client."
+            )
+            return False
 
         if is_admin_user and is_demo_account:
             logger.info(
-                f"[cTrader.AdminDemo] Admin @{(target_user or {}).get('username')} connected Demo account {acct_num}. Routing via dedicated Demo environment cluster (demo.ctraderapi.com)..."
+                f"[cTrader.AdminDemo] Admin @{(target_user or {}).get('username')} connected Demo account {acct_num}. "
+                f"Routed via dedicated Demo environment client (demo.ctraderapi.com)."
             )
-            if self._active_environment() != "demo":
-                self._environment_override = "demo"
-                await self._close_transport()
-                self._app_authenticated_event.clear()
-                try:
-                    await asyncio.wait_for(self._app_authenticated_event.wait(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    logger.error(f"[cTrader.AdminDemo] Dedicated Demo environment reconnect timed out for Admin account {acct_num}")
-                    return False
 
         # Initialize account state
         self.account_states[acct_num] = {
@@ -738,15 +738,10 @@ class CTraderClient:
         self.account_to_user_map.pop(old_num, None)
         if old_num in self.account_states:
             self.account_states[old_num]["authStatus"] = AccountAuthStatus.UNAUTHENTICATED.value
-        if target_environment != self._active_environment():
-            self._environment_override = target_environment
-            await self._close_transport()
-            self._app_authenticated_event.clear()
-            try:
-                await asyncio.wait_for(self._app_authenticated_event.wait(), timeout=15.0)
-            except asyncio.TimeoutError:
-                logger.error(f"[cTrader.Switch] Environment reconnect to {target_environment} timed out")
-                return False
+        # Dual-client architecture: reject if this client doesn't match the target env
+        if target_environment != self._env:
+            logger.info(f"[cTrader.Dispatch] Switch target account {new_num} env={target_environment} does not match this client env={self._env}; skipping.")
+            return False
         
         if old_num and old_num != new_num:
             logger.info(f"[cTrader.Switch] Detaching old account session: {old_num}")
@@ -1205,4 +1200,114 @@ if _SHARD_COUNT > 1:
     ctrader_client = ShardManager(shard_count=_SHARD_COUNT)
     logger.info("[cTrader.Client] ShardManager active with %d shards.", _SHARD_COUNT)
 else:
-    ctrader_client = CTraderClient(shard_id=0, shard_count=1)
+    ctrader_client = CTraderClient(shard_id=0, shard_count=1, env=get_ctrader_env())
+
+# --- Dual-environment client (Admin DEMO support) ---
+# Separate persistent client for the OTHER environment so admin users can connect
+# DEMO accounts while regular LIVE users stay connected simultaneously. Both clients
+# share ticker handlers (registered via register_ctrader_handler_on_all) and their
+# account_to_user_map is merged transparently via the resolve helpers below.
+_MAIN_ENV = (get_ctrader_env() or "live").lower()
+_ALT_ENV = "demo" if _MAIN_ENV == "live" else "live"
+ctrader_client_alt = CTraderClient(shard_id=0, shard_count=1, env=_ALT_ENV)
+logger.info(f"[cTrader.Client] Dual-env clients ready: main={_MAIN_ENV}, alt={_ALT_ENV}")
+
+def all_ctrader_clients() -> List["CTraderClient"]:
+    """Returns both live+demo clients. Handlers, startup and per-account lookups iterate this list."""
+    return [ctrader_client, ctrader_client_alt]
+
+def resolve_client_for_env(env: Optional[str]) -> "CTraderClient":
+    """Returns the client bound to the given environment ('live' or 'demo')."""
+    if not env:
+        return ctrader_client
+    e = str(env).lower()
+    if e == getattr(ctrader_client, "_env", _MAIN_ENV):
+        return ctrader_client
+    return ctrader_client_alt
+
+def resolve_client_for_account(account_id: Any) -> "CTraderClient":
+    """Returns the client that owns the given account (searches both clients)."""
+    for c in all_ctrader_clients():
+        acct_num = getattr(c, "_clean_numeric_account_id", lambda x: None)(account_id)
+        if acct_num and acct_num in getattr(c, "account_states", {}):
+            return c
+    return ctrader_client  # fallback
+
+def resolve_client_for_user_account(user: Dict[str, Any], account: Dict[str, Any]) -> "CTraderClient":
+    """Determines the correct client based on user role + account type.
+
+    Admin + DEMO account => demo client. All others => live/main client.
+    Regular users with DEMO accounts also route to demo client (broker requirement).
+    """
+    account_type = str((account or {}).get("accountType", "")).upper()
+    is_live_flag = (account or {}).get("isLive")
+    if account_type == "DEMO" or is_live_flag is False:
+        env = "demo"
+    elif account_type == "LIVE" or is_live_flag is True:
+        env = "live"
+    else:
+        env = _MAIN_ENV
+    return resolve_client_for_env(env)
+
+def register_handler_on_all(payload_type: int, callback):
+    """Registers a message handler on BOTH clients (used by ticker at startup)."""
+    for c in all_ctrader_clients():
+        try:
+            c.register_handler(payload_type, callback)
+        except Exception as exc:
+            logger.warning(f"[cTrader.Handler] register_handler_on_all warning: {exc}")
+
+def register_event_listener_on_all(callback):
+    """Registers a lifecycle event listener on BOTH clients."""
+    for c in all_ctrader_clients():
+        try:
+            c.register_event_listener(callback)
+        except Exception as exc:
+            logger.warning(f"[cTrader.Handler] register_event_listener_on_all warning: {exc}")
+
+def find_account_state(acct_num: int) -> Dict[str, Any]:
+    """Returns the account state dict from whichever client owns this account (empty if none)."""
+    for c in all_ctrader_clients():
+        state = getattr(c, "account_states", {}).get(int(acct_num) if acct_num else 0)
+        if state:
+            return state
+    return {}
+
+def find_user_for_account(acct_num: int) -> Optional[str]:
+    """Returns the userId mapped to this account across both clients."""
+    for c in all_ctrader_clients():
+        uid = getattr(c, "account_to_user_map", {}).get(int(acct_num) if acct_num else 0)
+        if uid:
+            return uid
+    return None
+
+def find_client_by_account(acct_num: int) -> Optional["CTraderClient"]:
+    """Returns the client that owns this account, or None if unknown."""
+    for c in all_ctrader_clients():
+        if int(acct_num) in getattr(c, "account_states", {}):
+            return c
+    return None
+
+def all_authenticated_accounts() -> List[int]:
+    """Returns ctidTraderAccountId list of all AUTHENTICATED accounts across both clients."""
+    out: List[int] = []
+    for c in all_ctrader_clients():
+        for acct, s in getattr(c, "account_states", {}).items():
+            if s.get("authStatus") == "AUTHENTICATED":
+                out.append(int(acct))
+    return out
+
+def merged_account_to_user_map() -> Dict[int, str]:
+    """Merged mapping across both clients."""
+    merged: Dict[int, str] = {}
+    for c in all_ctrader_clients():
+        merged.update(getattr(c, "account_to_user_map", {}) or {})
+    return merged
+
+def merged_account_states() -> Dict[int, Dict[str, Any]]:
+    """Merged account_states across both clients."""
+    merged: Dict[int, Dict[str, Any]] = {}
+    for c in all_ctrader_clients():
+        merged.update(getattr(c, "account_states", {}) or {})
+    return merged
+
